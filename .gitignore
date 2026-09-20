@@ -1,0 +1,14 @@
+.venv/
+.knowledge/
+**/__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Environment & Local Configuration
+.env
+.env.*
+!.env.example
+*.local
+.knowledgeignore.local
+
+

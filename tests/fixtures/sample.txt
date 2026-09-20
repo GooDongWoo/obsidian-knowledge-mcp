@@ -1,0 +1,3 @@
+The public text fixture has no explicit metadata.
+
+It is separated into another paragraph.

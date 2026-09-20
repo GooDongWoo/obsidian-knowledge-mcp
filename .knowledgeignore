@@ -1,0 +1,52 @@
+# Seeded from .gitignore; knowledge indexing has independent exclusions.
+# Obsidian and OS metadata
+.obsidian/
+.trash/
+.git/
+Thumbs.db
+Desktop.ini
+.DS_Store
+$RECYCLE.BIN/
+# Build and binary artifacts
+**/.vs/
+**/*.ipch
+**/*.opendb
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/Debug/
+**/Release/
+**/x64/
+**/x86/
+**/*.exe
+**/*.dll
+**/*.lib
+**/*.obj
+**/*.bin
+**/*.iso
+**/*.img
+**/*.mp3
+**/*.mp4
+**/*.wav
+**/*.flac
+**/*.avi
+**/*.mkv
+**/*.mov
+**/*.zip
+**/*.7z
+**/*.rar
+**/*.tar
+**/*.tar.gz
+**/*.hdf5
+**/*.h5
+**/*.pt
+**/*.pth
+**/*.onnx
+# MCP-specific additions
+# Runtime-generated files and this project
+.knowledge/
+00_System/knowledge-mcp/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc

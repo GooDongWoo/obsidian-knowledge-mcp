@@ -1,0 +1,16 @@
+types:
+  diary:
+    paths:
+      - "10_Daily/**"
+  brainstorming:
+    paths:
+      - "**/*브레인스토밍*"
+      - "**/*아이디어*"
+  award:
+    paths:
+      - "**/*수상*"
+      - "**/*상장*"
+      - "**/*award*"
+  experience:
+    paths:
+      - "**/*경험*"
