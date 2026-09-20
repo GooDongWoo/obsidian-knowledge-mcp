@@ -43,6 +43,23 @@ To permanently solve these resource bottlenecks, the architecture was restructur
 
 ## 2. Architecture
 
+<p align="center">
+  <a href="docs/obsidian-knowledge-architecture.html">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+      <source media="(prefers-color-scheme: light)" srcset="docs/architecture-light.png">
+      <img alt="Obsidian Knowledge MCP Architecture" src="docs/architecture-dark.png" width="100%">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
+  <em>💡 Click the diagram above to open the <strong><a href="docs/obsidian-knowledge-architecture.html">Interactive Architecture Diagram (HTML)</a></strong> in your browser (supports zoom/pan, route inspection, and node search).</em>
+</p>
+
+<details>
+<summary><b>View Text-based ASCII Diagram</b></summary>
+
 ```text
 [ Obsidian Vault Files ] (.md, .txt, .pdf)
          │
@@ -64,10 +81,7 @@ To permanently solve these resource bottlenecks, the architecture was restructur
          └──> [ SQLite State ] (Vault/.knowledge/state.sqlite3)
                  └── File sync manifests, generation logs, query history
 ```
-
-> [!TIP]
-> View the full interactive diagram in your browser:  
-> 🔗 [Interactive Architecture Diagram (HTML)](docs/obsidian-knowledge-architecture.html)
+</details>
 
 ---
 
