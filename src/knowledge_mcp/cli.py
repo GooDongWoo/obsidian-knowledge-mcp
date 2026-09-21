@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 import anyio
                 from .proxy import run_stdio_proxy
 
-                anyio.run(run_stdio_proxy, f"http://{host}:{port}/sse")
+                anyio.run(run_stdio_proxy, f"http://{host}:{port}/sse", settings)
                 return 0
 
         # index and rebuild
