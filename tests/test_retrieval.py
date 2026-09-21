@@ -84,7 +84,7 @@ async def test_reranker_loads_on_first_use_and_replaces_rrf_scores(monkeypatch):
     assert [item.score for item in ranked] == [0.8, 0.2]
     assert reranker.loaded
     await reranker.rerank("q", [result("a", "one", 0.9), result("b", "two", 0.1)])
-    assert calls == [("dragonkue/bge-reranker-v2-m3-ko", "cpu")]
+    assert calls == [("dragonkue/bge-reranker-v2-m3-ko", "cuda")]
 
 
 @pytest.mark.anyio

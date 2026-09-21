@@ -22,7 +22,7 @@ class LocalReranker:
         if self._model is None:
             from sentence_transformers import CrossEncoder
 
-            self._model = CrossEncoder(self.model_name, device="cpu")
+            self._model = CrossEncoder(self.model_name, device="cuda")
 
     async def rerank(self, query: str, candidates: list[SearchResult]) -> list[SearchResult]:
         if not candidates:
@@ -40,7 +40,5 @@ class LocalReranker:
         if self._model is None:
             from sentence_transformers import CrossEncoder
 
-            # Both dense models stay resident for request-time switching; keep
-            # the optional reranker off GPU to avoid exhausting VRAM.
-            self._model = CrossEncoder(self.model_name, device="cpu")
+            self._model = CrossEncoder(self.model_name, device="cuda")
         return self._model.predict([(query, candidate.document) for candidate in candidates])
