@@ -95,9 +95,12 @@ def test_serve_starts_with_partial_file_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.Settings, "from_env", lambda _: settings)
     monkeypatch.setattr(cli, "ensure_qdrant", lambda _: None)
     monkeypatch.setattr(cli, "_dependencies", lambda _: (None, None, {"bge": Indexer()}))
+    async def run_async(**kwargs):
+        calls.append(kwargs)
+
     monkeypatch.setattr(
         cli, "create_application",
-        lambda *_: SimpleNamespace(mcp=SimpleNamespace(run=lambda **kwargs: calls.append(kwargs))),
+        lambda *_: SimpleNamespace(mcp=SimpleNamespace(run_async=run_async)),
     )
 
     assert cli.main(["serve", "--standalone"]) == 0
@@ -118,7 +121,19 @@ def test_serve_proxy_starts_daemon_and_proxies(tmp_path, monkeypatch):
 
     assert cli.main(["serve"]) == 0
     assert "start_daemon" in calls
-    assert any(c[0] == "proxy" for c in calls if isinstance(c, tuple))
+    proxy_call = next(c for c in calls if isinstance(c, tuple) and c[0] == "proxy")
+    assert proxy_call[1][0] == "http://127.0.0.1:8765/mcp"
+
+
+def test_cli_import_keeps_ml_out_of_client_process():
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [sys.executable, "-c", "import sys, knowledge_mcp.cli; "
+         "assert not {'torch', 'onnxruntime', 'fastembed', 'sentence_transformers'} & sys.modules.keys()"],
+        check=True, timeout=30,
+    )
 from knowledge_mcp.config import Settings
 
 

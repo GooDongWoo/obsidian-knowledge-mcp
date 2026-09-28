@@ -53,6 +53,40 @@ async def points(indexer):
     return records
 
 
+@pytest.mark.anyio
+async def test_cancelled_generation_swap_records_partial_and_recovers(indexer, monkeypatch):
+    import asyncio
+
+    assert (await indexer.sync()).added == 1
+    source = indexer.settings.vault_root / "sample.md"
+    source.write_text("# Changed\nRecover interrupted generation", encoding="utf-8")
+    original = indexer.store.replace_generation
+    swapped = asyncio.Event()
+
+    async def interrupt_after_swap(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        swapped.set()
+        await asyncio.Event().wait()
+        return result
+
+    monkeypatch.setattr(indexer.store, "replace_generation", interrupt_after_swap)
+    task = asyncio.create_task(indexer.sync())
+    await asyncio.wait_for(swapped.wait(), timeout=10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    status = indexer.operation_log.index_status(indexer.settings.collection_name)
+    assert status["status"] == "partial"
+    assert status["error_code"] == "sync_cancelled"
+    # The old manifest survives and the next ordinary sync reconciles it with
+    # Qdrant's completed swap; no rebuild or automatic replay is needed.
+    monkeypatch.setattr(indexer.store, "replace_generation", original)
+    recovered = await indexer.sync()
+    assert recovered.changed == 1 and recovered.failed == 0
+    assert (await indexer.sync()).unchanged == 1
+
+
+
 def test_default_manifest_uses_store_collection(tmp_path):
     from knowledge_mcp.indexer import KnowledgeIndexer
 
@@ -143,7 +177,8 @@ async def test_modified_deleted_and_excluded_sources(indexer):
 @pytest.mark.anyio
 @pytest.mark.parametrize("stage", ["parse", "embed", "upload"])
 async def test_failed_update_preserves_previous_and_isolates_other_files(indexer, monkeypatch, stage):
-    await indexer.sync()
+    initial = await indexer.sync()
+    assert initial.added == 1 and initial.failed == 0, initial
     previous = (await points(indexer))[0]
     root = indexer.settings.vault_root
     (root / "sample.md").write_text("SENSITIVE_DOCUMENT_BODY changed", encoding="utf-8")

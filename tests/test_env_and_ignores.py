@@ -5,6 +5,26 @@ from knowledge_mcp.config import Settings
 from knowledge_mcp.documents import discover_sources
 
 
+def test_cli_loads_fastmcp_settings_before_import(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    (tmp_path / ".env").write_text(
+        "FASTMCP_CHECK_FOR_UPDATES=off\nFASTMCP_TELEMETRY_MODE=off\n", encoding="utf-8"
+    )
+    environment = os.environ.copy()
+    for name in ("FASTMCP_CHECK_FOR_UPDATES", "FASTMCP_TELEMETRY_MODE", "KNOWLEDGE_PROJECT_ROOT"):
+        environment.pop(name, None)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    subprocess.run(
+        [sys.executable, "-c", "import knowledge_mcp.cli, fastmcp; "
+         "assert fastmcp.settings.check_for_updates == 'off'; "
+         "assert fastmcp.settings.telemetry_mode == 'off'"],
+        cwd=tmp_path, env=environment, check=True, timeout=30,
+    )
+
+
 def test_env_file_loading_in_settings(tmp_path, monkeypatch):
     vault = tmp_path / "my_vault"
     vault.mkdir()

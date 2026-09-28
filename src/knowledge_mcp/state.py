@@ -209,16 +209,11 @@ class OperationLog:
 
 
 @contextmanager
-def index_lock(runtime_dir: Path) -> Iterator[None]:
+def index_lock(runtime_dir: Path, *, lock_name: str = "index.lock") -> Iterator[None]:
     """Serialize indexers with a Windows advisory lock, releasing it always."""
     directory = Path(runtime_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "index.lock").open("a+b") as lock_file:
-        lock_file.seek(0)
-        if not lock_file.read(1):
-            lock_file.seek(0)
-            lock_file.write(b"0")
-            lock_file.flush()
+    with (directory / lock_name).open("a+b") as lock_file:
         lock_file.seek(0)
         while True:
             try:
@@ -227,6 +222,11 @@ def index_lock(runtime_dir: Path) -> Iterator[None]:
             except OSError:
                 time.sleep(0.1)
         try:
+            # Windows permits locking beyond EOF. Initialize only after owning
+            # the byte: reading it first fails when another process holds it.
+            if lock_file.seek(0, 2) == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
             yield
         finally:
             lock_file.seek(0)

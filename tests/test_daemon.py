@@ -37,6 +37,42 @@ def test_get_daemon_pid(tmp_path):
     assert get_daemon_pid(runtime_dir) is None
 
 
+def test_separate_clients_serialize_daemon_startup(tmp_path):
+    import subprocess
+    import sys
+
+    script = tmp_path / "start.py"
+    script.write_text('''
+import sys, time
+from pathlib import Path
+from types import SimpleNamespace
+import knowledge_mcp.daemon as daemon
+from knowledge_mcp.config import Settings
+root = Path(sys.argv[1])
+settings = Settings(root / 'vault', root / 'runtime', Settings.DEFAULT_QDRANT_URL,
+                    'test', Settings.DEFAULT_DENSE_MODEL, 'test', project_root=root)
+ready = root / 'ready'
+daemon.is_daemon_running = lambda **_: ready.exists()
+def launch(*args, **kwargs):
+    with (root / 'starts').open('a') as log:
+        log.write('start\\n')
+    time.sleep(0.3)
+    (settings.runtime_dir / 'daemon.pid').write_text('4242')
+    ready.touch()
+    return SimpleNamespace(pid=4242, poll=lambda: None)
+daemon.subprocess.Popen = launch
+assert daemon.start_daemon_process(settings, timeout=5) == 4242
+''', encoding="utf-8")
+    children = [subprocess.Popen([sys.executable, str(script), str(tmp_path)]) for _ in range(2)]
+    try:
+        assert [child.wait(timeout=30) for child in children] == [0, 0]
+        assert (tmp_path / "starts").read_text().splitlines() == ["start"]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+
+
 def test_is_daemon_running_success():
     class DummyResponse:
         status = 200
@@ -68,7 +104,7 @@ def test_start_daemon_process_launches(settings):
     mock_proc.pid = 9999
     mock_proc.poll.return_value = None
 
-    running_states = [False, True]
+    running_states = [False, False, True]
 
     def fake_is_running(port=8765, host="127.0.0.1"):
         return running_states.pop(0) if running_states else True
@@ -86,7 +122,7 @@ def test_start_daemon_process_win32_headless(settings):
     mock_proc.pid = 9999
     mock_proc.poll.return_value = None
 
-    with patch("knowledge_mcp.daemon.is_daemon_running", side_effect=[False, True]), \
+    with patch("knowledge_mcp.daemon.is_daemon_running", side_effect=[False, False, True]), \
          patch("sys.platform", "win32"), \
          patch("pathlib.Path.is_file", return_value=True), \
          patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
@@ -117,7 +153,19 @@ def test_stop_daemon_process(settings):
         assert not (settings.runtime_dir / "daemon.pid").exists()
 
 
-def test_run_daemon_registers_tools_and_runs_sse(settings):
+def test_startup_timeout_terminates_owned_child_before_unlock(settings):
+    process = MagicMock(pid=9999)
+    process.poll.return_value = None
+    with patch("knowledge_mcp.daemon.is_daemon_running", return_value=False), \
+         patch("subprocess.Popen", return_value=process), \
+         patch("subprocess.run") as kill:
+        with pytest.raises(TimeoutError):
+            start_daemon_process(settings, timeout=0)
+    assert kill.call_args.args[0] == ["taskkill", "/F", "/T", "/PID", "9999"]
+    process.wait.assert_called_once()
+
+
+def test_run_daemon_registers_tools_and_runs_streamable_http(settings):
     class FakeIndexer:
         async def sync(self, assume_locked=False):
             from knowledge_mcp.indexer import IndexRunSummary
@@ -147,5 +195,8 @@ def test_run_daemon_registers_tools_and_runs_sse(settings):
         assert "knowledge-index-sync" in tools
         assert mcp_mock.run.called
         kwargs = mcp_mock.run.call_args[1]
-        assert kwargs["transport"] == "sse"
+        assert kwargs["transport"] == "http"
+        assert kwargs["path"] == "/mcp"
+        assert kwargs["host_origin_protection"] is True
+        assert "127.0.0.1" in kwargs["allowed_hosts"]
         assert kwargs["port"] == 8765

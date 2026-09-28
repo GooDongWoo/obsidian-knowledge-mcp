@@ -1,13 +1,15 @@
 """Read-only FastMCP application for the local knowledge collection."""
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastmcp import FastMCP
+from fastmcp.tools import ToolResult
+from mcp.types import TextContent
 
 from .config import Settings
-from .search import SearchRequest, SearchResult
 from .state import OperationLog
 
 
@@ -33,6 +35,8 @@ class KnowledgeApplication:
         embedding_model: Literal["dragonkue/BGE-m3-ko"] | None = None,
         rerank: bool = False,
     ) -> list[dict[str, Any]]:
+        from .search import SearchRequest, SearchResult
+
         request = SearchRequest(
             query=query,
             document_type=document_type,
@@ -123,7 +127,7 @@ def create_application(settings: Settings, store: Any, operation_log: OperationL
         embedding_model: Literal["dragonkue/BGE-m3-ko"] | None = None,
         rerank: bool = False,
     ) -> list[dict[str, Any]]:
-        return await application.find(
+        results = await application.find(
             query=query,
             document_type=document_type,
             file_type=file_type,
@@ -135,6 +139,13 @@ def create_application(settings: Settings, store: Any, operation_log: OperationL
             limit=limit,
             embedding_model=embedding_model,
             rerank=rerank,
+        )
+        # Keep FastMCP 2's per-result text contract while exposing modern
+        # structured output using the inferred list schema's result envelope.
+        return ToolResult(
+            content=[TextContent(type="text", text=json.dumps(item, ensure_ascii=False, indent=2))
+                     for item in results],
+            structured_content={"result": results},
         )
 
     @mcp.tool(name="knowledge-index-status", description="Show the local Vault index status.")

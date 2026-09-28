@@ -1,5 +1,6 @@
 """Incremental, per-source indexing with recoverable generation commits."""
 
+import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -48,6 +49,17 @@ class KnowledgeIndexer:
     async def sync(self, *, assume_locked: bool = False) -> IndexRunSummary:
         """Serialize writers unless caller holds the index lock; store no document bodies."""
         summary = IndexRunSummary()
+        try:
+            return await self._sync(summary, assume_locked=assume_locked)
+        except asyncio.CancelledError:
+            # Cancellation can arrive between generation swap and manifest
+            # commit. Preserve recovery inputs and don't leave an old success
+            # as the reported outcome of this interrupted run.
+            self._failure(summary, "sync_cancelled")
+            self._record(summary)
+            raise
+
+    async def _sync(self, summary: IndexRunSummary, *, assume_locked: bool) -> IndexRunSummary:
         with nullcontext() if assume_locked else index_lock(self.settings.runtime_dir):
             stage = "schema_check_failed"
             try:

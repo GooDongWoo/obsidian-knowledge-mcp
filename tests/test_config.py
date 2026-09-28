@@ -21,7 +21,9 @@ def test_settings_resolve_vault_from_project(tmp_path, monkeypatch):
         settings.client_name = "other"
 
 
-def test_settings_reject_unsafe_runtime_overrides(monkeypatch):
+def test_settings_reject_unsafe_runtime_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_VAULT_ROOT", str(tmp_path / "vault"))
+    monkeypatch.setenv("KNOWLEDGE_PROJECT_ROOT", str(tmp_path / "project"))
     monkeypatch.setenv("KNOWLEDGE_QDRANT_URL", "https://remote.example")
     with pytest.raises(ValueError, match="KNOWLEDGE_QDRANT_URL"):
         Settings.from_env("codex")
@@ -32,6 +34,8 @@ def test_settings_reject_unsafe_runtime_overrides(monkeypatch):
         Settings.from_env("codex")
 
 
-def test_settings_accept_bge_model(monkeypatch):
+def test_settings_accept_bge_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_VAULT_ROOT", str(tmp_path / "vault"))
+    monkeypatch.setenv("KNOWLEDGE_PROJECT_ROOT", str(tmp_path / "project"))
     monkeypatch.setenv("KNOWLEDGE_DENSE_MODEL", "dragonkue/BGE-m3-ko")
     assert Settings.from_env("codex").dense_model == "dragonkue/BGE-m3-ko"

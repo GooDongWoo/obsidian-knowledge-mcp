@@ -1,7 +1,8 @@
-"""Daemon server lifecycle and SSE application runner."""
+"""Daemon lifecycle and Streamable HTTP application runner."""
 
 import asyncio
 import atexit
+import math
 from dataclasses import asdict
 import os
 from pathlib import Path
@@ -28,26 +29,19 @@ def get_daemon_pid(runtime_dir: Path) -> int | None:
 
 
 def is_daemon_running(port: int = 8765, host: str = "127.0.0.1") -> bool:
-    """Check if the daemon is responding on /health or /sse."""
-    for path in ("/health", "/sse"):
-        try:
-            req = urllib.request.Request(
-                f"http://{host}:{port}{path}",
-                headers={"Accept": "text/event-stream, application/json, */*"},
-            )
-            with urllib.request.urlopen(req, timeout=1.0) as response:
-                if response.status == 200:
-                    return True
-        except Exception:
-            continue
-    return False
+    """Check readiness without a protocol ping or a persistent event stream."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=1.0) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 
 def start_daemon_process(
     settings: Settings | None = None,
     port: int = 8765,
     host: str = "127.0.0.1",
-    timeout: float = 60.0,
+    timeout: float | None = None,
 ) -> int:
     """Start the daemon in a background process and wait for readiness."""
     if is_daemon_running(port=port, host=host):
@@ -56,6 +50,23 @@ def start_daemon_process(
 
     if settings is None:
         settings = Settings.from_env("codex")
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("KNOWLEDGE_DAEMON_START_TIMEOUT", "900"))
+        except ValueError:
+            timeout = 900.0
+        if not math.isfinite(timeout) or timeout <= 0:
+            timeout = 900.0
+
+    # Each stdio client owns a separate proxy. Serialize startup across those
+    # processes, then recheck readiness before allocating another model copy.
+    with index_lock(settings.runtime_dir, lock_name="daemon-start.lock"):
+        if is_daemon_running(port=port, host=host):
+            return get_daemon_pid(settings.runtime_dir) or 0
+        return _start_daemon_locked(settings, port, host, timeout)
+
+
+def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: float) -> int:
 
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
     log_path = settings.runtime_dir / "daemon.log"
@@ -117,7 +128,18 @@ def start_daemon_process(
             )
         time.sleep(0.5)
 
-    raise TimeoutError(f"Daemon did not become healthy within {timeout} seconds on http://{host}:{port}/sse")
+    # Keep the startup lock until the child is gone. A slow model load must not
+    # survive this deadline and race the next client's startup. Windows venv
+    # launchers have a child interpreter, so terminate the owned process tree.
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        proc.terminate()
+    proc.wait(timeout=5)
+    raise TimeoutError(f"Daemon did not become healthy within {timeout} seconds on http://{host}:{port}/mcp")
 
 
 def stop_daemon_process(
@@ -161,7 +183,7 @@ def stop_daemon_process(
 
 
 def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Run the daemon server: ensure Qdrant, sync once, and start SSE FastMCP."""
+    """Ensure Qdrant, sync once, and serve the shared models over HTTP."""
     from .cli import _dependencies, ensure_qdrant
 
     pid_path = settings.runtime_dir / "daemon.pid"
@@ -169,7 +191,7 @@ def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) ->
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
 
     def cleanup_pid() -> None:
-        if pid_path.is_file():
+        if get_daemon_pid(settings.runtime_dir) == os.getpid():
             try:
                 pid_path.unlink()
             except OSError:
@@ -181,7 +203,16 @@ def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) ->
         ensure_qdrant(settings)
         store, operation_log, indexers = _dependencies(settings)
 
+        sync_lock = asyncio.Lock()
+
         async def sync_all(*, rebuild: bool = False) -> dict[str, Any]:
+            # Wait asynchronously before entering the Windows file lock. Two
+            # simultaneous tools/call requests must not block the event loop
+            # while the first writer awaits Qdrant.
+            async with sync_lock:
+                return await sync_all_locked(rebuild=rebuild)
+
+        async def sync_all_locked(*, rebuild: bool = False) -> dict[str, Any]:
             if rebuild:
                 with index_lock(settings.runtime_dir):
                     for selected in store.stores.values():
@@ -221,6 +252,9 @@ def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) ->
 
             return JSONResponse({"status": "ok", "pid": os.getpid()})
 
-        mcp.run(transport="sse", host=host, port=port)
+        mcp.run(
+            transport="http", host=host, port=port, path="/mcp",
+            host_origin_protection=True, allowed_hosts=[host, "127.0.0.1", "localhost", "[::1]"],
+        )
     finally:
         cleanup_pid()

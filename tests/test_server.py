@@ -43,7 +43,7 @@ async def test_find_tool_exposes_only_two_read_only_tools(settings):
     from knowledge_mcp.server import create_application
 
     application = create_application(settings, FakeStore(), OperationLog(settings.runtime_dir))
-    tools = await application.mcp.get_tools()
+    tools = {tool.name: tool for tool in await application.mcp.list_tools()}
     assert set(tools) == {"qdrant-find", "knowledge-index-status"}
 
 
@@ -56,7 +56,7 @@ async def test_status_tool_is_read_only(settings):
     result = await application.status()
     assert isinstance(result, dict)
     assert result["embedding_device"] == "cpu"
-    assert "qdrant-store" not in (await application.mcp.get_tools())
+    assert "qdrant-store" not in {tool.name for tool in await application.mcp.list_tools()}
 
 
 @pytest.mark.anyio
@@ -73,7 +73,7 @@ async def test_find_exposes_model_and_rerank_options(settings):
     await application.find(query="검색", embedding_model="dragonkue/BGE-m3-ko", rerank=True)
     assert store.request.embedding_model == "dragonkue/BGE-m3-ko"
     assert store.request.rerank is True
-    tool = (await application.mcp.get_tools())["qdrant-find"]
+    tool = next(tool for tool in await application.mcp.list_tools() if tool.name == "qdrant-find")
     assert "embedding_model" in tool.parameters["properties"]
     assert "dragonkue/BGE-m3-ko" in str(tool.parameters["properties"]["embedding_model"])
     assert "rerank" in tool.parameters["properties"]

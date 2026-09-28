@@ -1,4 +1,4 @@
-"""Launcher: ensure Qdrant, synchronize the Vault, then run stdio MCP or SSE daemon."""
+"""Launcher for the shared HTTP daemon and its stdio protocol proxy."""
 
 import argparse
 import asyncio
@@ -10,7 +10,11 @@ import sys
 import time
 from urllib.request import urlopen
 
-from .config import Settings
+from .config import Settings, _load_env_file
+
+# FastMCP reads its settings during import, before main() is entered.
+_load_env_file()
+
 from .daemon import (
     get_daemon_pid,
     is_daemon_running,
@@ -18,10 +22,6 @@ from .daemon import (
     start_daemon_process,
     stop_daemon_process,
 )
-from .embeddings import create_embedding_provider
-from .indexer import KnowledgeIndexer
-from .qdrant_store import KnowledgeStore
-from .retrieval import MultiModelStore
 from .server import create_application
 from .state import Manifest, OperationLog, index_lock
 
@@ -46,6 +46,11 @@ def model_settings(settings: Settings) -> dict[str, Settings]:
 
 
 def _dependencies(settings: Settings):
+    from .embeddings import create_embedding_provider
+    from .indexer import KnowledgeIndexer
+    from .qdrant_store import KnowledgeStore
+    from .retrieval import MultiModelStore
+
     log = OperationLog(settings.runtime_dir)
     stores = {}
     indexers = {}
@@ -97,7 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     # serve command
     serve_parser = subparsers.add_parser("serve", help="Run MCP stdio proxy or standalone server")
     serve_parser.add_argument("--client", choices=("codex", "claude-code", "antigravity"), default="codex")
-    serve_parser.add_argument("--standalone", action="store_true", help="Run legacy in-process server without daemon")
+    serve_parser.add_argument("--standalone", action="store_true", help="Run in-process stdio server without daemon")
     serve_parser.add_argument("--host", default=DEFAULT_DAEMON_HOST, help="Daemon host")
     serve_parser.add_argument("--port", type=int, default=DEFAULT_DAEMON_PORT, help="Daemon port")
 
@@ -133,10 +138,10 @@ def main(argv: list[str] | None = None) -> int:
             if action == "start":
                 if is_daemon_running(port=port, host=host):
                     pid = get_daemon_pid(settings.runtime_dir)
-                    print(f"Daemon is already running on http://{host}:{port}/sse (PID: {pid})")
+                    print(f"Daemon is already running on http://{host}:{port}/mcp (PID: {pid})")
                     return 0
                 pid = start_daemon_process(settings, port=port, host=host)
-                print(f"Daemon started on http://{host}:{port}/sse (PID: {pid})")
+                print(f"Daemon started on http://{host}:{port}/mcp (PID: {pid})")
                 return 0
             elif action == "stop":
                 stopped = stop_daemon_process(settings, port=port, host=host)
@@ -149,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                 running = is_daemon_running(port=port, host=host)
                 pid = get_daemon_pid(settings.runtime_dir)
                 if running:
-                    print(f"Daemon is running on http://{host}:{port}/sse (PID: {pid})")
+                    print(f"Daemon is running on http://{host}:{port}/mcp (PID: {pid})")
                 else:
                     print("Daemon is stopped.")
                 return 0 if running else 1
@@ -162,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if command == "serve":
             if getattr(args, "standalone", False):
-                # Legacy in-process server
+                # Standalone mode owns its models in this process.
                 ensure_qdrant(settings)
                 store, operation_log, indexers = _dependencies(settings)
 
@@ -177,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
                     if hasattr(store, "reranker") and hasattr(store.reranker, "warmup"):
                         await asyncio.to_thread(store.reranker.warmup)
                     application = create_application(settings, store, operation_log)
-                    application.mcp.run(transport="stdio")
+                    await application.mcp.run_async(transport="stdio")
 
                 asyncio.run(run_standalone())
                 return 0
@@ -188,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 import anyio
                 from .proxy import run_stdio_proxy
 
-                anyio.run(run_stdio_proxy, f"http://{host}:{port}/sse", settings)
+                anyio.run(run_stdio_proxy, f"http://{host}:{port}/mcp", settings)
                 return 0
 
         # index and rebuild
