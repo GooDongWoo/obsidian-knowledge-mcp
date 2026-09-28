@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Local read-only Obsidian knowledge MCP"
 requires-python = ">=3.11"
 dependencies = [
-  "fastmcp==2.7.0",
+  "fastmcp==4.0.10",
+  "mcp==2.2.0",
+  "anyio>=4.9,<5",
   "fastembed-gpu==0.8.0",
   "sentence-transformers>=3,<6",
   "onnxruntime-gpu==1.26.0",
@@ -29,7 +31,6 @@ knowledge-mcp = "knowledge_mcp.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
-qdrant-mcp = ["mcp-server-qdrant==0.8.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/knowledge_mcp"]
