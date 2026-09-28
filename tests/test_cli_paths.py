@@ -122,7 +122,7 @@ def test_serve_proxy_starts_daemon_and_proxies(tmp_path, monkeypatch):
 from knowledge_mcp.config import Settings
 
 
-def test_launcher_uses_project_compose_and_vault_runtime(tmp_path, monkeypatch):
+def test_launcher_uses_project_compose_and_project_runtime(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     project = tmp_path / "project"
     project.mkdir()
@@ -145,7 +145,8 @@ def test_launcher_uses_project_compose_and_vault_runtime(tmp_path, monkeypatch):
     ensure_qdrant(settings, timeout_seconds=1)
 
     assert str(project / "docker-compose.yml") in calls[0][0][0]
-    assert calls[0][1]["env"]["KNOWLEDGE_QDRANT_STORAGE"] == str(settings.qdrant_storage_dir.resolve()).replace("\\", "/")
+    expected_storage = (project / ".knowledge" / "qdrant").resolve()
+    assert calls[0][1]["env"]["KNOWLEDGE_QDRANT_STORAGE"] == str(expected_storage).replace("\\", "/")
     assert settings.qdrant_storage_dir.is_dir()
 
 

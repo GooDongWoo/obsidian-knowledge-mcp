@@ -7,7 +7,7 @@ services:
       - "127.0.0.1:6334:6334"
     volumes:
       - type: bind
-        source: ${KNOWLEDGE_QDRANT_STORAGE:?KNOWLEDGE_QDRANT_STORAGE must point to Vault .knowledge/qdrant}
+        source: ${KNOWLEDGE_QDRANT_STORAGE:-./.knowledge/qdrant}
         target: /qdrant/storage
     deploy:
       resources:

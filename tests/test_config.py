@@ -9,11 +9,12 @@ def test_settings_resolve_vault_from_project(tmp_path, monkeypatch):
     project = tmp_path / "00_System" / "knowledge-mcp"
     project.mkdir(parents=True)
     monkeypatch.setenv("KNOWLEDGE_VAULT_ROOT", str(tmp_path))
+    monkeypatch.setenv("KNOWLEDGE_PROJECT_ROOT", str(project))
     settings = Settings.from_env("codex")
     assert settings.vault_root == tmp_path.resolve()
     assert settings.qdrant_url == "http://127.0.0.1:6333"
     assert settings.collection_name == "obsidian_knowledge_bge_m3_ko_v1"
-    assert settings.runtime_dir == tmp_path.resolve() / ".knowledge"
+    assert settings.runtime_dir == project.resolve() / ".knowledge"
     assert settings.dense_model == "dragonkue/BGE-m3-ko"
     assert settings.client_name == "codex"
     with pytest.raises(FrozenInstanceError):

@@ -5,10 +5,10 @@ def test_project_and_vault_roots_are_distinct(tmp_path):
     project = tmp_path / "project"
     settings = Settings.from_paths(vault_root=vault, project_root=project)
     assert settings.vault_root != settings.project_root
-    assert settings.runtime_dir == vault / ".knowledge"
+    assert settings.runtime_dir == project / ".knowledge"
 
 
-def test_external_project_config_and_vault_runtime(tmp_path, monkeypatch):
+def test_external_project_config_and_project_runtime(tmp_path, monkeypatch):
     from knowledge_mcp.config import Settings
 
     vault = tmp_path / "vault"
@@ -17,7 +17,7 @@ def test_external_project_config_and_vault_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("KNOWLEDGE_PROJECT_ROOT", str(project))
     settings = Settings.from_env("codex")
     assert settings.project_root == project.resolve()
-    assert settings.runtime_dir == (vault / ".knowledge").resolve()
+    assert settings.runtime_dir == (project / ".knowledge").resolve()
 
 
 def test_discovery_reads_ignore_from_project_but_matches_vault_paths(tmp_path):

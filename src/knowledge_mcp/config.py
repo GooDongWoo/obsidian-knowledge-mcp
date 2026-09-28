@@ -75,7 +75,7 @@ class Settings:
         project_root = Path(project_root).resolve()
         return cls(
             vault_root=vault_root,
-            runtime_dir=vault_root / ".knowledge",
+            runtime_dir=project_root / ".knowledge",
             qdrant_url=cls.DEFAULT_QDRANT_URL,
             collection_name="obsidian_knowledge_bge_m3_ko_v1",
             dense_model=cls.DEFAULT_DENSE_MODEL,
@@ -102,7 +102,7 @@ class Settings:
             raise ValueError(f"KNOWLEDGE_DENSE_MODEL must be one of {DENSE_MODELS}")
         return cls(
             vault_root=vault_root,
-            runtime_dir=vault_root / ".knowledge",
+            runtime_dir=project_root / ".knowledge",
             qdrant_url=qdrant_url,
             collection_name=os.environ.get("KNOWLEDGE_COLLECTION", "obsidian_knowledge_bge_m3_ko_v1"),
             dense_model=dense_model,

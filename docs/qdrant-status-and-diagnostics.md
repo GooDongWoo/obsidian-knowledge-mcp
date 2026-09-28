@@ -95,7 +95,7 @@ $sample.result.points | Select-Object id, payload
 
 ## 3. SQLite 상태 데이터베이스 (`state.sqlite3`) 구조
 
-Vault의 `.knowledge/state.sqlite3`는 파일 수준의 동기화 상태와 실행 이력을 관리합니다.
+프로젝트의 `.knowledge/state.sqlite3`는 파일 수준의 동기화 상태와 실행 이력을 관리합니다.
 
 ### 3.1 스키마 개요
 
@@ -146,7 +146,7 @@ Vault의 `.knowledge/state.sqlite3`는 파일 수준의 동기화 상태와 실�
 $vault = $env:KNOWLEDGE_VAULT_ROOT
 $project = $env:KNOWLEDGE_PROJECT_ROOT
 $python = Join-Path $project '.venv\Scripts\python.exe'
-$db = Join-Path $vault '.knowledge\state.sqlite3'
+$db = Join-Path $project '.knowledge\state.sqlite3'
 
 & $python -c @'
 import sqlite3, sys

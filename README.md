@@ -78,7 +78,7 @@ To permanently solve these resource bottlenecks, the architecture was restructur
          ├──> [ Local Docker Qdrant ] (Port 6333 / 6334)
          │       └── Dense vectors, BM25 index, text chunks & payloads
          │
-         └──> [ SQLite State ] (Vault/.knowledge/state.sqlite3)
+         └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
                  └── File sync manifests, generation logs, query history
 ```
 </details>

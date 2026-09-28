@@ -24,7 +24,7 @@
          ├──> [ Docker Qdrant ] (127.0.0.1:6333, 6334)
          │       └── 벡터 임베딩, BM25 인덱스, 문서 청크 및 메타데이터
          │
-         └──> [ SQLite State ] (Vault/.knowledge/state.sqlite3)
+         └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
                  └── 파일별 완료 기록, 인덱스 실행 로그, 질의 통계
 ```
 
@@ -187,7 +187,7 @@ Qdrant 컨테이너만 수동으로 시작하거나 확인할 때 사용합니�
 docker ps --filter "name=obsidian-knowledge-mcp-qdrant-1"
 
 # Docker Compose 수동 기동
-$env:KNOWLEDGE_QDRANT_STORAGE = (Join-Path $vault '.knowledge\qdrant').Replace('\', '/')
+$env:KNOWLEDGE_QDRANT_STORAGE = (Join-Path $project '.knowledge\qdrant').Replace('\', '/')
 docker compose -f (Join-Path $project 'docker-compose.yml') up -d
 ```
 
