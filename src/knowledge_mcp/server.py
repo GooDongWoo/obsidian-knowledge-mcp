@@ -51,12 +51,17 @@ class KnowledgeApplication:
             rerank=rerank,
         )
         started = time.perf_counter()
-        results: list[SearchResult] = await self.store.hybrid_search(request)
+        try:
+            results: list[SearchResult] = await self.store.hybrid_search(request)
+        except Exception:
+            self.operation_log.record_query(
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                rerank_requested=request.rerank, error_code="search_failed",
+            )
+            raise
         self.operation_log.record_query(
-            query=request.query,
-            filters=request.model_dump(exclude={"query"}),
-            results=[result.model_dump() for result in results],
-            client_name=self.settings.client_name,
+            results=results,
+            rerank_requested=request.rerank,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
         )
         return [result.model_dump() for result in results]

@@ -241,6 +241,16 @@ docker compose -f (Join-Path $project 'docker-compose.yml') up -d
 
 ## 7. 관련 상세 문서 안내
 
+### 로컬 기록과 개인정보 보존 정책
+
+`state.sqlite3`의 질의 기록은 시각, 지연 시간, 결과 수, 리랭크 요청/적용 여부와 안정적인 실패 코드만 저장합니다. 검색어, 필터, 클라이언트명, 결과 ID, 결과 경로와 본문은 저장하지 않습니다. 실제 리랭크 적용 여부를 검색 계층에서 전달하기 전까지 `rerank_applied`는 `NULL`입니다. 요청값만으로 성공을 추정하지 않습니다.
+
+질의 지표는 기본 30일, 최대 10,000행을 보존합니다. `.env`의 `KNOWLEDGE_QUERY_RETENTION_DAYS`, `KNOWLEDGE_QUERY_MAX_ROWS`로 조절하며 0이나 잘못된 값은 기본값으로 돌아갑니다. 색인 이력은 기본 30일, 최대 1,000행을 보존합니다(`KNOWLEDGE_INDEX_RETENTION_DAYS`, `KNOWLEDGE_INDEX_MAX_ROWS`). 각 컬렉션의 최신 색인 상태는 이력 상한과 별도로 항상 유지합니다. 시작, 운영 기록 저장, 상태 조회 때 정리합니다. 작은 삭제는 SQLite 페이지를 재사용하고 큰 삭제는 `VACUUM`으로 줄입니다. 파일 manifest는 영구 색인 상태로 보존되어 Vault 크기에 따라 커질 수 있습니다.
+
+기존 DB의 최초 초기화는 런타임 디렉터리에 `state.pre-privacy.sqlite3` 일회성 백업을 만든 뒤 원문 질의/결과 테이블과 과거 예외 텍스트를 정리하고 `VACUUM`을 수행합니다. 스키마 변경 실패는 롤백되며 정리 중단 시 다음 시작에 재시도합니다. 백업에는 기존 민감 정보가 남아 있고 자동 삭제하거나 덮어쓰지 않습니다. 마이그레이션 시 콘솔 경고가 백업 위치를 알려주며 백그라운드 실행에서는 이 문서의 고정 파일명으로 확인할 수 있습니다. 데몬을 중지하고 상태를 검증한 뒤 복구가 필요 없으면 직접 삭제하세요. 복구하려면 모든 데몬/색인기를 중지하고 현재 DB의 사본을 보존한 다음 백업을 `state.sqlite3`로 복사하고 이전 체크아웃을 실행합니다. 이 버전으로 복구 DB를 실행하면 다시 마이그레이션됩니다. 외부 백업과 파일시스템 복구 사본은 정리 대상에 포함되지 않습니다.
+
+`daemon.log`는 실행 중에도 기본 1 MiB에서 회전하며 `daemon.log.1`~`.3` 세 파일을 보관합니다. `KNOWLEDGE_DAEMON_LOG_MAX_BYTES`, `KNOWLEDGE_DAEMON_LOG_BACKUP_COUNT`로 상한을 조절합니다. 파일에는 시각, 심각도, 안정적인 이벤트 코드만 저장하며 라이브러리 메시지, stdout/stderr 원문, traceback은 버립니다. 포그라운드 실행에서는 콘솔 진단을 확인할 수 있습니다. 로그 초기화 전 실패는 종료 코드만 확인 가능할 수 있습니다. 기존 로그에는 과거 원문이 남아 있을 수 있으므로 필요 시 데몬을 중지한 뒤 직접 정리하세요.
+
 - [Qdrant 상태 키워드 및 진단 가이드 (qdrant-status-and-diagnostics.md)](qdrant-status-and-diagnostics.md): Qdrant REST API, SQLite 상태 테이블 분석, 미색인 파일 추적 및 에러 코드 상세.
 - [문서 메타데이터 및 설정 가이드 (metadata-and-configuration.md)](metadata-and-configuration.md): Frontmatter 문법, sidecar yaml, ignore 설정, security 레벨.
 - [데몬 아키텍처 및 리소스 상한 설계 문서 (2026-09-20-daemon-architecture-and-resource-limits.md)](2026-09-20-daemon-architecture-and-resource-limits.md): 메모리 프리징 해결 과정과 5중 리소스 가드레일 분석.

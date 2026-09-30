@@ -4,6 +4,10 @@ import asyncio
 import atexit
 import math
 from dataclasses import asdict
+from contextlib import contextmanager
+import io
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import subprocess
@@ -14,7 +18,85 @@ import urllib.request
 
 from .config import Settings
 from .server import create_application
-from .state import index_lock
+from .state import index_lock, positive_env_int
+
+
+_EVENT_CODES = {"runtime_message", "runtime_stdout", "runtime_stderr", "daemon_starting", "daemon_failed"}
+
+
+class _EventFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        code = getattr(record, "event_code", "runtime_message")
+        if not isinstance(code, str) or code not in _EVENT_CODES:
+            code = "runtime_message"
+        # Never format the message, arguments, logger name or traceback: any
+        # of them may include a query, returned document or filesystem path.
+        return f"{self.formatTime(record)} {logging.getLevelName(record.levelno)} {code}"
+
+
+class _EventStream(io.TextIOBase):
+    def __init__(self, handler: logging.Handler, code: str, console=None) -> None:
+        self.handler = handler
+        self.code = code
+        self.console = console
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    def write(self, text: str) -> int:
+        if text.strip():
+            record = logging.LogRecord("daemon", logging.INFO, "", 0, "", (), None)
+            record.event_code = self.code
+            self.handler.handle(record)
+        if self.console is not None:
+            self.console.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.handler.flush()
+        if self.console is not None:
+            self.console.flush()
+
+
+@contextmanager
+def daemon_logging(runtime_dir: Path, *, console: bool = False):
+    """Bound logs in the child process, including writes from third parties."""
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        runtime_dir / "daemon.log", encoding="utf-8",
+        maxBytes=positive_env_int("KNOWLEDGE_DAEMON_LOG_MAX_BYTES", 1048576),
+        backupCount=positive_env_int("KNOWLEDGE_DAEMON_LOG_BACKUP_COUNT", 3),
+    )
+    handler.setFormatter(_EventFormatter())
+    root = logging.getLogger()
+    loggers = [root] + [logger for logger in logging.root.manager.loggerDict.values()
+                        if isinstance(logger, logging.Logger)]
+    previous = [(logger, logger.handlers[:], logger.propagate) for logger in loggers]
+    stdout, stderr = sys.stdout, sys.stderr
+    for logger in loggers:
+        logger.handlers = []
+        logger.propagate = True
+    root.addHandler(handler)
+    if console:
+        root.addHandler(logging.StreamHandler(stderr))
+    sys.stdout = _EventStream(handler, "runtime_stdout", stdout if console else None)
+    sys.stderr = _EventStream(handler, "runtime_stderr", stderr if console else None)
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = stdout, stderr
+        for logger, handlers, propagate in previous:
+            logger.handlers = handlers
+            logger.propagate = propagate
+        # Libraries may configure new loggers while running. Detach handlers
+        # bound to our temporary streams before returning to an embedding caller.
+        previous_loggers = {logger for logger, _, _ in previous}
+        for logger in logging.root.manager.loggerDict.values():
+            if isinstance(logger, logging.Logger) and logger not in previous_loggers:
+                logger.handlers = [item for item in logger.handlers
+                                   if not isinstance(getattr(item, "stream", None), _EventStream)]
+        handler.close()
 
 
 def get_daemon_pid(runtime_dir: Path) -> int | None:
@@ -96,6 +178,7 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
     env["KNOWLEDGE_PROJECT_ROOT"] = str(settings.project_root)
     env["KNOWLEDGE_COLLECTION"] = settings.collection_name
     env["KNOWLEDGE_DENSE_MODEL"] = settings.dense_model
+    env["KNOWLEDGE_DAEMON_BACKGROUND"] = "1"
 
     creationflags = 0
     startupinfo = None
@@ -105,18 +188,19 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(settings.project_root),
-            stdout=log_file,
-            stderr=log_file,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            startupinfo=startupinfo,
-            env=env,
-            close_fds=True,
-        )
+    # The child installs rotating safe streams. An inherited raw file handle
+    # would bypass both privacy filtering and rotation for its entire lifetime.
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(settings.project_root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        creationflags=creationflags,
+        startupinfo=startupinfo,
+        env=env,
+        close_fds=True,
+    )
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -183,6 +267,16 @@ def stop_daemon_process(
 
 
 def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -> None:
+    with daemon_logging(settings.runtime_dir, console=os.environ.get("KNOWLEDGE_DAEMON_BACKGROUND") != "1"):
+        try:
+            logging.getLogger(__name__).warning("", extra={"event_code": "daemon_starting"})
+            _run_daemon(settings, host, port)
+        except BaseException:
+            logging.getLogger(__name__).error("", extra={"event_code": "daemon_failed"})
+            raise
+
+
+def _run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -> None:
     """Ensure Qdrant, sync once, and serve the shared models over HTTP."""
     from .cli import _dependencies, ensure_qdrant
 

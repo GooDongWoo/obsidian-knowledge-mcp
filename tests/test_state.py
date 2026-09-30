@@ -1,6 +1,6 @@
-import json
 import msvcrt
 import sqlite3
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -94,7 +94,7 @@ def test_manifest_clear_removes_only_selected_collection_and_preserves_queries(t
     assert first.completed_files() == {}
     assert "shared.md" in second.completed_files()
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
-        assert connection.execute("SELECT query FROM queries").fetchall() == [("keep this query",)]
+        assert connection.execute("SELECT result_count FROM queries").fetchall() == [(0,)]
 
 
 def test_default_manifest_clear_discards_legacy_files_without_erasing_logs(tmp_path):
@@ -112,7 +112,7 @@ def test_default_manifest_clear_discards_legacy_files_without_erasing_logs(tmp_p
 
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
-        assert connection.execute("SELECT query FROM queries").fetchone()[0] == "retained query"
+        assert connection.execute("SELECT result_count FROM queries").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM index_runs").fetchone()[0] == 1
 
 
@@ -121,32 +121,204 @@ def test_private_query_log_has_no_excerpt(operation_log):
 
     stored = operation_log.database_text_for_test()
     assert "private body" not in stored
-    assert "point-private" in stored
-    assert "private.md" in stored
+    assert "secret" not in stored
+    assert "point-private" not in stored
+    assert "private.md" not in stored
 
 
-def test_query_log_persists_filters_without_result_body(tmp_path):
+def test_query_log_discards_filters_client_and_result_details(tmp_path):
     operation_log = OperationLog(tmp_path)
     filters = {"document_type": ["brainstorming"], "security_level": "private"}
 
-    operation_log.record_query(query="secret", filters=filters, results=[private_result()])
+    operation_log.record_query(query="secret", filters=filters, results=[private_result()],
+                               client_name="private-client", elapsed_ms=12.5,
+                               rerank_requested=True, rerank_applied=None)
 
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
-        stored_filters = connection.execute("SELECT filters FROM queries").fetchone()[0]
-    assert json.loads(stored_filters) == filters
-    assert "private body" not in operation_log.database_text_for_test()
+        metrics = connection.execute(
+            "SELECT elapsed_ms, result_count, rerank_requested, rerank_applied, error_code FROM queries"
+        ).fetchall()
+    assert metrics == [(12.5, 1, 1, None, None)]
+    stored = operation_log.database_text_for_test()
+    for sensitive in ("secret", "brainstorming", "private-client", "private.md", "private body"):
+        assert sensitive not in stored
 
 
-def test_query_filter_migration_preserves_existing_queries(tmp_path):
+def test_query_migration_backs_up_once_scrubs_pages_and_preserves_index_state(tmp_path):
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
         connection.execute("CREATE TABLE queries (id INTEGER PRIMARY KEY, queried_at TEXT NOT NULL, query TEXT NOT NULL)")
-        connection.execute("INSERT INTO queries(queried_at, query) VALUES ('now', 'old query')")
+        connection.execute("INSERT INTO queries(queried_at, query) VALUES ('2026-09-30T00:00:00+00:00', 'old query')")
+        connection.execute("CREATE TABLE query_results (query_id INTEGER, source_path TEXT)")
+        connection.execute("INSERT INTO query_results VALUES (1, 'sensitive-result.md')")
+        connection.execute("""CREATE TABLE index_runs (id INTEGER PRIMARY KEY, started_at TEXT,
+                           status TEXT, generation TEXT, added INTEGER, changed INTEGER, deleted INTEGER)""")
+        connection.execute("INSERT INTO index_runs VALUES (1, 'now', 'completed', 'preserved', 1, 2, 3)")
+        connection.execute("""CREATE TABLE collection_files (collection_name TEXT, path TEXT,
+                           content_hash TEXT, generation TEXT, point_count INTEGER, point_ids TEXT,
+                           completed_at TEXT, PRIMARY KEY(collection_name, path))""")
+        connection.execute("INSERT INTO collection_files VALUES (?, 'manifest.md', 'hash', 'preserved', 1, '[]', 'now')",
+                           (state.DEFAULT_COLLECTION_NAME,))
 
-    OperationLog(tmp_path)
+    with pytest.warns(RuntimeWarning, match="state.pre-privacy.sqlite3"):
+        log = OperationLog(tmp_path)
+    backup = tmp_path / "state.pre-privacy.sqlite3"
+    original_backup = backup.read_bytes()
+    restarted = OperationLog(tmp_path)
 
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
-        rows = connection.execute("SELECT query, filters FROM queries ORDER BY id").fetchall()
-    assert rows == [("old query", "{}")]
+        rows = connection.execute("SELECT result_count, rerank_requested, rerank_applied FROM queries").fetchall()
+    assert rows == [(1, None, None)]
+    assert "old query" not in restarted.database_text_for_test()
+    assert "sensitive-result.md" not in restarted.database_text_for_test()
+    assert "old query" in original_backup.decode("utf-8", errors="ignore")
+    assert backup.read_bytes() == original_backup
+    assert restarted.index_status()["generation"] == "preserved"
+    assert Manifest(tmp_path).completed_files()["manifest.md"].generation == "preserved"
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "-1"])
+def test_invalid_retention_limits_use_bounded_defaults(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("KNOWLEDGE_QUERY_RETENTION_DAYS", value)
+    monkeypatch.setenv("KNOWLEDGE_QUERY_MAX_ROWS", value)
+    monkeypatch.setattr(state, "_now", lambda: "2026-10-01T00:00:00+00:00")
+    log = OperationLog(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.execute("INSERT INTO queries(queried_at, result_count) VALUES ('2026-08-31T00:00:00+00:00', 0)")
+    log.record_query(results=[], error_code="search_failed")
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT error_code FROM queries").fetchall() == [("search_failed",)]
+
+
+def test_query_retention_keeps_exact_30_day_boundary_during_operation(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_now", lambda: "2026-10-01T00:00:00+00:00")
+    log = OperationLog(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.executemany(
+            "INSERT INTO queries(queried_at, result_count) VALUES (?, 0)",
+            [("2026-08-31T23:59:59+00:00",), ("2026-09-01T00:00:00+00:00",)],
+        )
+    log.record_query(query="discard", results=[])
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT queried_at FROM queries ORDER BY id").fetchall() == [
+            ("2026-09-01T00:00:00+00:00",), ("2026-10-01T00:00:00+00:00",)]
+
+
+def test_query_row_cap_reclaims_database_pages_and_preserves_latest_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_QUERY_MAX_ROWS", "3")
+    log = OperationLog(tmp_path)
+    log.record_index(generation="keep", added=1, changed=0, deleted=0)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.executemany("INSERT INTO queries(queried_at, result_count) VALUES (?, 0)",
+                               [("2026-10-01T00:00:00+00:00",)] * 20000)
+    before = (tmp_path / "state.sqlite3").stat().st_size
+    log.record_query(results=[], elapsed_ms=42)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM queries").fetchone()[0] == 3
+        assert connection.execute("SELECT elapsed_ms FROM queries ORDER BY id DESC LIMIT 1").fetchone()[0] == 42
+        assert connection.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    assert (tmp_path / "state.sqlite3").stat().st_size < before / 2
+    assert OperationLog(tmp_path).index_status()["generation"] == "keep"
+
+
+def test_index_history_retention_preserves_latest_inactive_collection_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_now", lambda: "2026-10-01T00:00:00+00:00")
+    log = OperationLog(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.executemany(
+            "INSERT INTO index_runs(started_at, collection_name, status, generation, added, changed, deleted) "
+            "VALUES (?, ?, 'completed', ?, 1, 0, 0)",
+            [("2026-08-01T00:00:00+00:00", None, "old-legacy"),
+             ("2026-08-02T00:00:00+00:00", None, "latest-legacy"),
+             ("2026-08-01T00:00:00+00:00", "inactive", "latest-inactive"),
+             ("2026-08-31T23:59:59+00:00", "active", "expired"),
+             ("2026-09-01T00:00:00+00:00", "active", "boundary"),
+             ("2026-10-01T00:00:00+00:00", "active", "latest-active")],
+        )
+    assert log.index_status("inactive")["generation"] == "latest-inactive"
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT generation FROM index_runs ORDER BY id").fetchall() == [
+            ("latest-legacy",), ("latest-inactive",), ("boundary",), ("latest-active",)]
+    assert OperationLog(tmp_path).index_status("active")["generation"] == "latest-active"
+
+
+def test_index_history_row_cap_exempts_latest_status_per_collection(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_INDEX_MAX_ROWS", "2")
+    log = OperationLog(tmp_path)
+    for number in range(10):
+        log.record_index(collection_name="active", generation=str(number), added=0, changed=0, deleted=0)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT generation FROM index_runs ORDER BY id").fetchall() == [
+            ("7",), ("8",), ("9",)]
+    assert log.index_status("active")["generation"] == "9"
+
+
+def test_query_retention_configuration_and_error_code_validation(tmp_path, monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_QUERY_RETENTION_DAYS", "1")
+    monkeypatch.setattr(state, "_now", lambda: "2026-10-01T00:00:00+00:00")
+    log = OperationLog(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.execute("INSERT INTO queries(queried_at, result_count) VALUES ('2026-09-29T00:00:00+00:00', 0)")
+    log.record_query(results=[], error_code="search_failed")
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT error_code FROM queries").fetchall() == [("search_failed",)]
+    with pytest.raises(ValueError):
+        log.record_query(results=[], error_code="private exception text")
+
+
+def test_privacy_migration_failure_rolls_back_schema_for_retry(tmp_path, monkeypatch):
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.execute("CREATE TABLE queries(id INTEGER PRIMARY KEY, queried_at TEXT, query TEXT)")
+        connection.execute("INSERT INTO queries VALUES (1, '2026-09-30T00:00:00+00:00', 'legacy-secret')")
+    original = state._add_column_if_missing
+
+    def fail_after_query_migration(*args):
+        raise RuntimeError("interrupted migration")
+
+    monkeypatch.setattr(state, "_add_column_if_missing", fail_after_query_migration)
+    with pytest.warns(RuntimeWarning), pytest.raises(RuntimeError, match="interrupted"):
+        OperationLog(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("SELECT query FROM queries").fetchall() == [("legacy-secret",)]
+    monkeypatch.setattr(state, "_add_column_if_missing", original)
+    with pytest.warns(RuntimeWarning):
+        log = OperationLog(tmp_path)
+    assert "legacy-secret" not in log.database_text_for_test()
+
+
+def test_privacy_migration_retries_compaction_after_interrupted_vacuum(tmp_path, monkeypatch):
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.execute("CREATE TABLE queries(id INTEGER PRIMARY KEY, queried_at TEXT, query TEXT)")
+        connection.execute("INSERT INTO queries VALUES (1, '2026-09-30T00:00:00+00:00', ?)",
+                           ("synthetic-secret" * 10000,))
+    original_connection = state._connection
+
+    class InterruptedConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, *args):
+            if sql == "VACUUM":
+                raise RuntimeError("interrupted vacuum")
+            return self.connection.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def fail_vacuum(runtime_dir):
+        with original_connection(runtime_dir) as connection:
+            yield InterruptedConnection(connection)
+
+    monkeypatch.setattr(state, "_connection", fail_vacuum)
+    with pytest.warns(RuntimeWarning), pytest.raises(RuntimeError, match="interrupted vacuum"):
+        OperationLog(tmp_path)
+    before = (tmp_path / "state.sqlite3").stat().st_size
+    monkeypatch.setattr(state, "_connection", original_connection)
+    with pytest.warns(RuntimeWarning):
+        OperationLog(tmp_path)
+    assert (tmp_path / "state.sqlite3").stat().st_size < before / 2
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        assert connection.execute("PRAGMA freelist_count").fetchone()[0] == 0
 
 
 def test_index_log_reports_latest_run(operation_log):
@@ -218,7 +390,8 @@ def test_error_migration_scrubs_legacy_private_text(tmp_path):
             """
         )
 
-    operation_log = OperationLog(tmp_path)
+    with pytest.warns(RuntimeWarning, match="state.pre-privacy.sqlite3"):
+        operation_log = OperationLog(tmp_path)
 
     assert "private body" not in operation_log.database_text_for_test()
     assert operation_log.index_status()["error_code"] is None

@@ -79,7 +79,7 @@ To permanently solve these resource bottlenecks, the architecture was restructur
          │       └── Dense vectors, BM25 index, text chunks & payloads
          │
          └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
-                 └── File sync manifests, generation logs, query history
+                 └── File sync manifests, generation logs, bounded query metrics
 ```
 </details>
 
@@ -231,6 +231,14 @@ Model loading, initial incremental sync, and reranker warmup have a separate 900
 ---
 
 ## 7. Documentation Index
+
+### Local privacy and retention
+
+`state.sqlite3` records query timestamps, latency, result count, requested/applied reranking, and stable failure codes. Search text, filters, client names, result identifiers, paths, and excerpts are discarded. Until the retrieval layer reports actual application, `rerank_applied` is `NULL`; a request is not evidence of successful reranking. Query metrics expire after 30 days and are capped at 10,000 rows (`KNOWLEDGE_QUERY_RETENTION_DAYS`, `KNOWLEDGE_QUERY_MAX_ROWS`). Historical index runs expire after 30 days and are capped at 1,000 rows (`KNOWLEDGE_INDEX_RETENTION_DAYS`, `KNOWLEDGE_INDEX_MAX_ROWS`), with the newest status for each collection always retained in addition to that cap. Startup, operation writes, and status reads enforce retention. SQLite reuses freed pages and compacts substantial deletion backlogs. Manifest state remains durable and grows with the Vault.
+
+The first initialization of an older database makes a consistent, one-time backup at `<runtime_dir>/state.pre-privacy.sqlite3`, migrates metrics, drops plaintext query/result data, scrubs legacy exception text, and runs `VACUUM`. Failed schema changes roll back and interrupted compaction is retried. The backup retains the old sensitive data and is never automatically deleted or overwritten. Its path is reported during migration; stop the daemon, verify index status, then manually remove the backup when recovery is no longer needed. To restore, stop every daemon/indexer, retain a copy of the current database, and copy the backup to `state.sqlite3` before running the previous checkout. Running this version on the restored database will migrate it again. External backups and filesystem recovery copies are outside this cleanup.
+
+`daemon.log` rotates within the running process at 1 MiB, keeping three numbered backups (`KNOWLEDGE_DAEMON_LOG_MAX_BYTES`, `KNOWLEDGE_DAEMON_LOG_BACKUP_COUNT`). Persisted records contain timestamp, severity, and stable event codes; arbitrary library messages, stdout/stderr text, and tracebacks are discarded. Foreground daemon runs still display console diagnostics. Background startup uses the child's rotating event streams rather than a raw append handle. A failure before logging initializes may only appear as an exit code. Existing older log files may still contain prior data; inspect and remove them manually after stopping the daemon if required. Invalid or zero retention/log limits fall back to the bounded defaults.
 
 For in-depth guides, operational scripts, and diagnostics:
 

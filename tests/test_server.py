@@ -1,4 +1,5 @@
 import pytest
+import sqlite3
 from fastembed.common.types import Device
 
 from knowledge_mcp.config import Settings
@@ -26,7 +27,7 @@ def settings(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_find_tool_returns_source_location_and_logs_query(settings):
+async def test_find_tool_returns_source_location_and_logs_only_metrics(settings):
     from knowledge_mcp.server import create_application
 
     application = create_application(settings, FakeStore(), OperationLog(settings.runtime_dir))
@@ -34,8 +35,27 @@ async def test_find_tool_returns_source_location_and_logs_query(settings):
     assert result[0]["source_path"] == "note.md"
     assert result[0]["start_line"] == 3
     db_text = application.operation_log.database_text_for_test()
-    assert db_text.find("알파") >= 0
-    assert db_text.find("codex") >= 0
+    assert "알파" not in db_text
+    assert "codex" not in db_text
+    assert "note.md" not in db_text
+    with sqlite3.connect(settings.runtime_dir / "state.sqlite3") as connection:
+        assert connection.execute("SELECT result_count, rerank_requested, rerank_applied FROM queries").fetchall() == [(1, 0, None)]
+
+
+@pytest.mark.anyio
+async def test_find_failure_records_stable_code_without_exception_payload(settings):
+    from knowledge_mcp.server import create_application
+
+    class FailingStore:
+        async def hybrid_search(self, request):
+            raise RuntimeError("sensitive-exception-payload")
+
+    application = create_application(settings, FailingStore(), OperationLog(settings.runtime_dir))
+    with pytest.raises(RuntimeError, match="sensitive-exception-payload"):
+        await application.find(query="sensitive-query", rerank=True)
+    with sqlite3.connect(settings.runtime_dir / "state.sqlite3") as connection:
+        assert connection.execute("SELECT result_count, rerank_requested, rerank_applied, error_code FROM queries").fetchall() == [(0, 1, None, "search_failed")]
+    assert "sensitive" not in application.operation_log.database_text_for_test()
 
 
 @pytest.mark.anyio

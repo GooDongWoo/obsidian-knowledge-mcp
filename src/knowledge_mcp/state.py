@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import msvcrt
+import os
 from pathlib import Path
 import re
 import sqlite3
 import time
 from typing import Iterator, Mapping, Sequence
+import warnings
 
 
 DATABASE_NAME = "state.sqlite3"
 DEFAULT_COLLECTION_NAME = "obsidian_knowledge_v1"
-ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
+ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+PRIVACY_BACKUP_NAME = "state.pre-privacy.sqlite3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +125,7 @@ class Manifest:
 
 
 class OperationLog:
-    """Stores operational metadata, never indexed or returned document bodies."""
+    """Stores bounded query metrics and durable index status, without query payloads."""
 
     def __init__(self, runtime_dir: Path) -> None:
         self.runtime_dir = Path(runtime_dir)
@@ -151,42 +154,36 @@ class OperationLog:
                 """,
                 (_now(), collection_name, status, generation, added, changed, deleted, error_code),
             )
+            _prune_operations(connection)
 
     def record_query(
         self,
         *,
-        query: str,
+        query: str | None = None,
         filters: Mapping[str, object] | None = None,
-        results: Sequence[Mapping[str, object]],
+        results: Sequence[Mapping[str, object]] = (),
         client_name: str | None = None,
         elapsed_ms: float | None = None,
+        rerank_requested: bool | None = None,
+        rerank_applied: bool | None = None,
+        error_code: str | None = None,
     ) -> None:
+        # Keep the legacy keyword API, but never serialize its payload fields.
+        if error_code is not None and not ERROR_CODE.fullmatch(error_code):
+            raise ValueError("error_code must be a stable lowercase identifier")
         with _connection(self.runtime_dir) as connection:
-            cursor = connection.execute(
-                "INSERT INTO queries(queried_at, query, filters, client_name, elapsed_ms) VALUES (?, ?, ?, ?, ?)",
-                (_now(), query, json.dumps(filters or {}, sort_keys=True), client_name, elapsed_ms),
-            )
-            query_id = cursor.lastrowid
-            connection.executemany(
+            connection.execute(
                 """
-                INSERT INTO query_results(query_id, rank, point_id, source_path, score, security_level)
+                INSERT INTO queries(queried_at, elapsed_ms, result_count, rerank_requested, rerank_applied, error_code)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [
-                    (
-                        query_id,
-                        rank,
-                        result.get("point_id"),
-                        result.get("source_path"),
-                        result.get("score"),
-                        result.get("security_level"),
-                    )
-                    for rank, result in enumerate(results, start=1)
-                ],
+                (_now(), elapsed_ms, len(results), rerank_requested, rerank_applied, error_code),
             )
+            _prune_operations(connection)
 
     def index_status(self, collection_name: str | None = None) -> dict[str, object]:
         with _connection(self.runtime_dir) as connection:
+            _prune_operations(connection)
             if collection_name is None:
                 row = connection.execute(
                     """
@@ -249,10 +246,41 @@ def _connection(runtime_dir: Path) -> Iterator[sqlite3.Connection]:
 
 def _initialize(runtime_dir: Path) -> None:
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    scrubbed_legacy_errors = False
+    # Separate from the index writer lock: indexers can initialize inside it.
+    with index_lock(runtime_dir, lock_name="state-migration.lock"):
+        _initialize_locked(runtime_dir)
+
+
+def _initialize_locked(runtime_dir: Path) -> None:
     with _connection(runtime_dir) as connection:
-        connection.executescript(
-            """
+        query_columns = _columns(connection, "queries")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        legacy_queries = bool(query_columns & {"query", "filters", "client_name"})
+        legacy_results = "query_results" in tables
+        legacy_errors = "error" in _columns(connection, "index_runs") and connection.execute(
+            "SELECT 1 FROM index_runs WHERE error IS NOT NULL LIMIT 1"
+        ).fetchone() is not None
+        backup_path = runtime_dir / PRIVACY_BACKUP_NAME
+        pending_compaction = backup_path.exists() and connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0] < 1
+        scrub = legacy_queries or legacy_results or legacy_errors or pending_compaction
+        if scrub:
+            if not backup_path.exists():
+                temporary_backup = backup_path.with_suffix(".sqlite3.tmp")
+                with closing(sqlite3.connect(temporary_backup)) as backup:
+                    connection.backup(backup)
+                temporary_backup.replace(backup_path)
+            warnings.warn(
+                f"Privacy migration backup retained at {backup_path}; it may contain sensitive data. "
+                "Remove it manually after verifying the migrated state.", RuntimeWarning, stacklevel=3,
+            )
+        connection.execute("BEGIN IMMEDIATE")
+        if legacy_queries:
+            connection.execute("ALTER TABLE queries RENAME TO legacy_queries")
+        # executescript commits an existing transaction. Execute each DDL
+        # statement separately so failed migration leaves the old schema usable.
+        schema = """
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 content_hash TEXT NOT NULL,
@@ -285,34 +313,79 @@ def _initialize(runtime_dir: Path) -> None:
             CREATE TABLE IF NOT EXISTS queries (
                 id INTEGER PRIMARY KEY,
                 queried_at TEXT NOT NULL,
-                query TEXT NOT NULL,
-                filters TEXT NOT NULL DEFAULT '{}',
-                client_name TEXT,
-                elapsed_ms REAL
-            );
-            CREATE TABLE IF NOT EXISTS query_results (
-                id INTEGER PRIMARY KEY,
-                query_id INTEGER NOT NULL REFERENCES queries(id),
-                rank INTEGER NOT NULL,
-                point_id TEXT,
-                source_path TEXT,
-                score REAL,
-                security_level TEXT
+                elapsed_ms REAL,
+                result_count INTEGER NOT NULL,
+                rerank_requested INTEGER,
+                rerank_applied INTEGER,
+                error_code TEXT
             );
             """
-        )
-        _add_column_if_missing(connection, "queries", "filters", "TEXT NOT NULL DEFAULT '{}'")
-        _add_column_if_missing(connection, "queries", "client_name", "TEXT")
-        _add_column_if_missing(connection, "queries", "elapsed_ms", "REAL")
+        for statement in schema.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        if legacy_queries:
+            elapsed = "q.elapsed_ms" if "elapsed_ms" in query_columns else "NULL"
+            count = "(SELECT COUNT(*) FROM query_results r WHERE r.query_id = q.id)" if legacy_results else "0"
+            connection.execute(
+                f"INSERT INTO queries(id, queried_at, elapsed_ms, result_count) "
+                f"SELECT q.id, q.queried_at, {elapsed}, {count} FROM legacy_queries q"
+            )
+        if legacy_results:
+            connection.execute("DROP TABLE query_results")
+        if legacy_queries:
+            connection.execute("DROP TABLE legacy_queries")
         _add_column_if_missing(connection, "index_runs", "error_code", "TEXT")
         _add_column_if_missing(connection, "index_runs", "collection_name", "TEXT")
         if "error" in _columns(connection, "index_runs"):
-            scrubbed_legacy_errors = connection.execute(
-                "UPDATE index_runs SET error = NULL WHERE error IS NOT NULL"
-            ).rowcount > 0
-    if scrubbed_legacy_errors:
-        with _connection(runtime_dir) as connection:
+            connection.execute("UPDATE index_runs SET error = NULL WHERE error IS NOT NULL")
+        if scrub:
+            connection.commit()
             connection.execute("VACUUM")
+        connection.execute("PRAGMA user_version = 1")
+        _prune_operations(connection)
+
+
+def positive_env_int(name: str, default: int, *, maximum: int = 2147483647) -> int:
+    """Invalid or disabled limits fall back to the bounded default."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if 0 < value <= maximum else default
+
+
+def _prune_operations(connection: sqlite3.Connection) -> None:
+    cutoff = (datetime.fromisoformat(_now()) - timedelta(
+        days=positive_env_int("KNOWLEDGE_QUERY_RETENTION_DAYS", 30, maximum=365000)
+    )).isoformat(timespec="seconds")
+    deleted = connection.execute(
+        "DELETE FROM queries WHERE julianday(queried_at) < julianday(?)", (cutoff,)
+    ).rowcount
+    deleted += connection.execute(
+        "DELETE FROM queries WHERE id IN (SELECT id FROM queries ORDER BY id DESC LIMIT -1 OFFSET ?)",
+        (positive_env_int("KNOWLEDGE_QUERY_MAX_ROWS", 10000),),
+    ).rowcount
+    index_cutoff = (datetime.fromisoformat(_now()) - timedelta(
+        days=positive_env_int("KNOWLEDGE_INDEX_RETENTION_DAYS", 30, maximum=365000)
+    )).isoformat(timespec="seconds")
+    # Latest status is permanent for each collection, including NULL legacy
+    # rows. Only historical runs are subject to age and count retention.
+    latest = "SELECT MAX(id) FROM index_runs GROUP BY collection_name"
+    deleted += connection.execute(
+        f"DELETE FROM index_runs WHERE id NOT IN ({latest}) AND julianday(started_at) < julianday(?)",
+        (index_cutoff,),
+    ).rowcount
+    deleted += connection.execute(
+        f"DELETE FROM index_runs WHERE id IN (SELECT id FROM index_runs "
+        f"WHERE id NOT IN ({latest}) ORDER BY id DESC LIMIT -1 OFFSET ?)",
+        (positive_env_int("KNOWLEDGE_INDEX_MAX_ROWS", 1000),),
+    ).rowcount
+    # Reuse freed pages for ordinary eviction; compact a substantial backlog.
+    # Rewriting the full manifest DB for every query after reaching the row cap
+    # would make bounded history unnecessarily expensive.
+    if deleted and connection.execute("PRAGMA freelist_count").fetchone()[0] >= 32:
+        connection.commit()
+        connection.execute("VACUUM")
 
 
 def _add_column_if_missing(

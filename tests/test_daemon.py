@@ -114,6 +114,8 @@ def test_start_daemon_process_launches(settings):
         pid = start_daemon_process(settings, port=8765, timeout=5.0)
         assert pid == 9999
         assert mock_popen.called
+        assert mock_popen.call_args.kwargs["stdout"] == __import__("subprocess").DEVNULL
+        assert mock_popen.call_args.kwargs["stderr"] == __import__("subprocess").DEVNULL
 
 
 def test_start_daemon_process_win32_headless(settings):
@@ -200,3 +202,58 @@ def test_run_daemon_registers_tools_and_runs_streamable_http(settings):
         assert kwargs["host_origin_protection"] is True
         assert "127.0.0.1" in kwargs["allowed_hosts"]
         assert kwargs["port"] == 8765
+
+
+def test_daemon_logging_rotates_during_one_process_without_sensitive_text(tmp_path, monkeypatch):
+    import logging
+    import sys
+    import knowledge_mcp.daemon as daemon
+
+    monkeypatch.setenv("KNOWLEDGE_DAEMON_LOG_MAX_BYTES", "256")
+    monkeypatch.setenv("KNOWLEDGE_DAEMON_LOG_BACKUP_COUNT", "2")
+    with daemon.daemon_logging(tmp_path):
+        for _ in range(100):
+            logging.getLogger("third_party").error("sensitive-query and private/path.md")
+            print("sensitive-document", file=sys.stderr)
+        try:
+            raise RuntimeError("sensitive-exception")
+        except RuntimeError:
+            logging.exception("sensitive-error")
+        logging.error("ignored", extra={"event_code": "sensitive"})
+    files = sorted(tmp_path.glob("daemon.log*"))
+    assert len(files) == 3
+    assert all(path.stat().st_size <= 256 for path in files)
+    stored = "".join(path.read_text(encoding="utf-8") for path in files)
+    assert "runtime_message" in stored
+    assert "runtime_stderr" in stored
+    assert "sensitive" not in stored
+    assert "private/path.md" not in stored
+
+
+def test_daemon_failure_log_has_no_exception_payload(settings):
+    with patch("knowledge_mcp.cli.ensure_qdrant", side_effect=RuntimeError("sensitive-vault-path")):
+        with pytest.raises(RuntimeError, match="sensitive-vault-path"):
+            run_daemon(settings)
+    stored = (settings.runtime_dir / "daemon.log").read_text(encoding="utf-8")
+    assert "daemon_failed" in stored
+    assert "sensitive" not in stored
+
+
+def test_daemon_logging_restores_streams_and_handlers_after_failure(tmp_path, capsys):
+    import logging
+    import sys
+    import knowledge_mcp.daemon as daemon
+
+    stdout, stderr = sys.stdout, sys.stderr
+    root = logging.getLogger()
+    handlers = root.handlers[:]
+    with pytest.raises(RuntimeError):
+        with daemon.daemon_logging(tmp_path, console=True):
+            print("interactive diagnostic", file=sys.stderr)
+            raise RuntimeError("failure")
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+    assert root.handlers == handlers
+    print("after cleanup", file=sys.stderr)
+    assert "interactive diagnostic" in capsys.readouterr().err
+    assert "interactive diagnostic" not in (tmp_path / "daemon.log").read_text(encoding="utf-8")
