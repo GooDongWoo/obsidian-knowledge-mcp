@@ -4,7 +4,7 @@ import asyncio
 import atexit
 import math
 from dataclasses import asdict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 import io
 import logging
 from logging.handlers import RotatingFileHandler
@@ -18,7 +18,7 @@ import urllib.request
 
 from .config import Settings
 from .server import create_application
-from .state import index_lock, positive_env_int
+from .state import async_index_lock, finish_thread, index_lock, positive_env_int, run_blocking
 
 
 _EVENT_CODES = {"runtime_message", "runtime_stdout", "runtime_stderr", "daemon_starting", "daemon_failed"}
@@ -111,7 +111,7 @@ def get_daemon_pid(runtime_dir: Path) -> int | None:
 
 
 def is_daemon_running(port: int = 8765, host: str = "127.0.0.1") -> bool:
-    """Check readiness without a protocol ping or a persistent event stream."""
+    """Check HTTP liveness, independently of model/index readiness."""
     try:
         with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=1.0) as response:
             return response.status == 200
@@ -125,7 +125,7 @@ def start_daemon_process(
     host: str = "127.0.0.1",
     timeout: float | None = None,
 ) -> int:
-    """Start the daemon in a background process and wait for readiness."""
+    """Start the daemon in a background process and wait for its listener."""
     if is_daemon_running(port=port, host=host):
         pid = get_daemon_pid(settings.runtime_dir) if settings else None
         return pid or 0
@@ -141,7 +141,7 @@ def start_daemon_process(
             timeout = 900.0
 
     # Each stdio client owns a separate proxy. Serialize startup across those
-    # processes, then recheck readiness before allocating another model copy.
+    # processes, then recheck liveness before allocating another model copy.
     with index_lock(settings.runtime_dir, lock_name="daemon-start.lock"):
         if is_daemon_running(port=port, host=host):
             return get_daemon_pid(settings.runtime_dir) or 0
@@ -212,8 +212,8 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
             )
         time.sleep(0.5)
 
-    # Keep the startup lock until the child is gone. A slow model load must not
-    # survive this deadline and race the next client's startup. Windows venv
+    # Keep the startup lock until the child is gone. A child whose listener
+    # never opens must not race the next client's startup. Windows venv
     # launchers have a child interpreter, so terminate the owned process tree.
     if sys.platform == "win32":
         subprocess.run(
@@ -277,8 +277,7 @@ def run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) ->
 
 
 def _run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Ensure Qdrant, sync once, and serve the shared models over HTTP."""
-    from .cli import _dependencies, ensure_qdrant
+    """Open HTTP first; the lifespan owns initialization and shared models."""
 
     pid_path = settings.runtime_dir / "daemon.pid"
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -294,57 +293,8 @@ def _run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -
     atexit.register(cleanup_pid)
 
     try:
-        ensure_qdrant(settings)
-        store, operation_log, indexers = _dependencies(settings)
-
-        sync_lock = asyncio.Lock()
-
-        async def sync_all(*, rebuild: bool = False) -> dict[str, Any]:
-            # Wait asynchronously before entering the Windows file lock. Two
-            # simultaneous tools/call requests must not block the event loop
-            # while the first writer awaits Qdrant.
-            async with sync_lock:
-                return await sync_all_locked(rebuild=rebuild)
-
-        async def sync_all_locked(*, rebuild: bool = False) -> dict[str, Any]:
-            if rebuild:
-                with index_lock(settings.runtime_dir):
-                    for selected in store.stores.values():
-                        if await selected.client.collection_exists(selected.settings.collection_name):
-                            await selected.client.delete_collection(selected.settings.collection_name)
-                    for indexer in indexers.values():
-                        indexer.manifest.clear()
-                    summaries = {
-                        model: await indexer.sync(assume_locked=True)
-                        for model, indexer in indexers.items()
-                    }
-            else:
-                summaries = {model: await indexer.sync() for model, indexer in indexers.items()}
-            for model, summary in summaries.items():
-                print(f"{model}: {asdict(summary)}", file=sys.stderr)
-            return {model: asdict(summary) for model, summary in summaries.items()}
-
-        # Indexing runs only ONCE upon daemon startup
-        asyncio.run(sync_all())
-
-        if hasattr(store, "reranker") and hasattr(store.reranker, "warmup"):
-            asyncio.run(asyncio.to_thread(store.reranker.warmup))
-
-        application = create_application(settings, store, operation_log)
+        application = create_daemon_application(settings)
         mcp = application.mcp
-
-        @mcp.tool(
-            name="knowledge-index-sync",
-            description="Trigger synchronization of the local Vault index.",
-        )
-        async def knowledge_index_sync(rebuild: bool = False) -> dict[str, Any]:
-            return await sync_all(rebuild=rebuild)
-
-        @mcp.custom_route("/health", methods=["GET"])
-        async def health(request):
-            from starlette.responses import JSONResponse
-
-            return JSONResponse({"status": "ok", "pid": os.getpid()})
 
         mcp.run(
             transport="http", host=host, port=port, path="/mcp",
@@ -352,3 +302,149 @@ def _run_daemon(settings: Settings, host: str = "127.0.0.1", port: int = 8765) -
         )
     finally:
         cleanup_pid()
+
+
+class _DaemonRuntime:
+    """One lifespan, one model set, and one FIFO lock for all sync requests."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.writer = asyncio.Lock()
+        self.dependencies_ready = asyncio.Event()
+        self.sync_tasks: set[asyncio.Task] = set()
+        self.stopping = False
+        self.status = {"state": "starting", "phase": "bootstrap", "last_completed": None,
+                       "last_error": None, "last_index": {}}
+
+    async def bootstrap(self) -> None:
+        from .cli import _dependencies, ensure_qdrant
+
+        try:
+            await run_blocking(ensure_qdrant, self.settings)
+            # Retain constructed clients even if shutdown occurs during model
+            # loading, so lifespan cleanup can close them on this event loop.
+            loading = asyncio.create_task(asyncio.to_thread(_dependencies, self.settings))
+            try:
+                dependencies = await asyncio.shield(loading)
+            except asyncio.CancelledError:
+                dependencies = await finish_thread(loading)
+                self.application.store, self.application.operation_log, self.application.indexers = dependencies
+                raise
+            self.application.store, self.application.operation_log, self.application.indexers = dependencies
+            self.status["last_index"] = await run_blocking(self.application.operation_log.index_status)
+            self.application.index_snapshot = await self.application.read_index_status()
+            self.dependencies_ready.set()
+            await self.sync()
+            reranker = getattr(self.application.store, "reranker", None)
+            if hasattr(reranker, "warmup"):
+                self.status["phase"] = "reranker_warmup"
+                try:
+                    await run_blocking(reranker.warmup)
+                except Exception:
+                    self.status["warmup_error"] = "reranker_warmup_failed"
+                finally:
+                    self.status["phase"] = "idle"
+                self.application.index_snapshot = await self.application.read_index_status()
+        except asyncio.CancelledError:
+            self.status.update(state="error", phase="stopped")
+            self.status["last_error"] = self.status["last_error"] or "startup_cancelled"
+            raise
+        except Exception:
+            self.status.update(state="error", phase="idle", last_error="bootstrap_failed")
+            logging.getLogger(__name__).error("", extra={"event_code": "daemon_failed"})
+        finally:
+            self.dependencies_ready.set()
+
+    async def sync(self, *, rebuild: bool = False) -> dict[str, Any]:
+        from fastmcp.exceptions import ToolError
+
+        task = asyncio.current_task()
+        self.sync_tasks.add(task)
+        try:
+            await self.dependencies_ready.wait()
+            if self.stopping or self.application.store is None:
+                raise ToolError("Initialization failed or server is stopping; inspect knowledge-index-status.")
+            async with self.writer:
+                self.status.update(state="indexing", phase="sync")
+                try:
+                    async with async_index_lock(self.settings.runtime_dir):
+                        if rebuild:
+                            for selected in self.application.store.stores.values():
+                                if await selected.client.collection_exists(selected.settings.collection_name):
+                                    await selected.client.delete_collection(selected.settings.collection_name)
+                            for indexer in self.application.indexers.values():
+                                await run_blocking(indexer.manifest.clear)
+                        summaries = {model: await indexer.sync(assume_locked=True)
+                                     for model, indexer in self.application.indexers.items()}
+                    result = {model: asdict(summary) for model, summary in summaries.items()}
+                    self.application.index_snapshot = await self.application.read_index_status()
+                    error = next((code for summary in summaries.values() for code in summary.error_codes), None)
+                    failed = any(summary.failed for summary in summaries.values())
+                    self.status.update(state="error" if failed else "ready", phase="idle",
+                                       last_error=error, last_index=result)
+                    if not failed:
+                        self.status["last_completed"] = result
+                    return result
+                except asyncio.CancelledError:
+                    self.status.update(state="error", phase="idle", last_error="sync_cancelled")
+                    await self.record_failure("sync_cancelled")
+                    raise
+                except Exception:
+                    self.status.update(state="error", phase="idle", last_error="sync_failed")
+                    await self.record_failure("sync_failed")
+                    raise ToolError("Index sync failed; inspect knowledge-index-status.") from None
+        finally:
+            self.sync_tasks.discard(task)
+
+    async def record_failure(self, code: str) -> None:
+        self.application.index_snapshot.update(status="partial", error_code=code)
+        try:
+            await run_blocking(self.application.operation_log.record_index,
+                              generation=None, added=0, changed=0, deleted=0,
+                              status="partial", error_code=code)
+        except Exception:
+            # A broken state DB must not mask cancellation or the primary error.
+            logging.getLogger(__name__).error("", extra={"event_code": "daemon_failed"})
+
+    @asynccontextmanager
+    async def lifespan(self, mcp):
+        bootstrap = asyncio.create_task(self.bootstrap(), name="knowledge-bootstrap")
+        try:
+            yield
+        finally:
+            self.stopping = True
+            tasks = self.sync_tasks | {bootstrap}
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Shield only cleanup, never across yield/another task's cancel scope.
+            import anyio
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(*tasks, return_exceptions=True)
+                store = self.application.store
+                stores = getattr(store, "stores", {"default": store})
+                for selected in stores.values():
+                    client = getattr(selected, "client", None)
+                    if client is not None:
+                        await client.close()
+
+
+def create_daemon_application(settings: Settings, *, sync_tool: bool = True):
+    """Register tools/health without touching Qdrant, models or the state DB."""
+    runtime = _DaemonRuntime(settings)
+    application = create_application(settings, lifespan=runtime.lifespan)
+    runtime.application = application
+    application.runtime_status = runtime.status
+
+    if sync_tool:
+        @application.mcp.tool(name="knowledge-index-sync", description="Trigger synchronization of the local Vault index.")
+        async def knowledge_index_sync(rebuild: bool = False) -> dict[str, Any]:
+            return await runtime.sync(rebuild=rebuild)
+
+    @application.mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+        from starlette.responses import JSONResponse
+
+        return JSONResponse({"status": runtime.status["state"], "pid": os.getpid()})
+
+    return application

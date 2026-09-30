@@ -231,12 +231,154 @@ def test_daemon_logging_rotates_during_one_process_without_sensitive_text(tmp_pa
 
 
 def test_daemon_failure_log_has_no_exception_payload(settings):
-    with patch("knowledge_mcp.cli.ensure_qdrant", side_effect=RuntimeError("sensitive-vault-path")):
+    with patch("knowledge_mcp.daemon.create_daemon_application", side_effect=RuntimeError("sensitive-vault-path")):
         with pytest.raises(RuntimeError, match="sensitive-vault-path"):
             run_daemon(settings)
     stored = (settings.runtime_dir / "daemon.log").read_text(encoding="utf-8")
     assert "daemon_failed" in stored
     assert "sensitive" not in stored
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["bootstrap", "index", "warmup"])
+async def test_lifecycle_failures_are_visible_and_existing_search_remains_usable(settings, monkeypatch, failure):
+    import asyncio
+    from fastmcp import Client
+    from knowledge_mcp import cli, daemon
+    from knowledge_mcp.indexer import IndexRunSummary
+    from knowledge_mcp.state import OperationLog
+    from test_server import FakeStore
+
+    def fail(*args):
+        raise RuntimeError("sensitive-content")
+
+    class Indexer:
+        async def sync(self, **kwargs):
+            return IndexRunSummary(failed=1, error_codes=["schema_check_failed"]) if failure == "index" else IndexRunSummary()
+
+    store = FakeStore()
+    store.reranker = type("Reranker", (), {"warmup": fail})()
+    monkeypatch.setattr(cli, "ensure_qdrant", fail if failure == "bootstrap" else lambda _: None)
+    monkeypatch.setattr(cli, "_dependencies", lambda _: (store, OperationLog(settings.runtime_dir), {"test": Indexer()}))
+    application = daemon.create_daemon_application(settings)
+    async with Client(application.mcp) as client:
+        async with asyncio.timeout(3):
+            while True:
+                status = (await client.call_tool("knowledge-index-status", {})).data
+                if status["state"] in {"error", "ready"} and (failure != "warmup" or status.get("warmup_error")):
+                    break
+                await asyncio.sleep(.01)
+        assert status["state"] == ("ready" if failure == "warmup" else "error")
+        result = await client.call_tool("qdrant-find", {"query": "query"}, raise_on_error=False)
+        assert result.is_error == (failure == "bootstrap")
+        if failure == "bootstrap":
+            assert "failed" in result.content[0].text and "indexing" not in result.content[0].text
+        assert "sensitive" not in str(status)
+        if failure == "index":
+            assert status["last_error"] == "schema_check_failed"
+
+
+@pytest.mark.anyio
+async def test_lifespan_cancels_initial_sync_and_closes_client_on_owning_loop(settings, monkeypatch):
+    import asyncio
+    from fastmcp import Client
+    from knowledge_mcp import cli, daemon
+    from knowledge_mcp.state import OperationLog
+    from test_server import FakeStore
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    closed = asyncio.Event()
+    owner = asyncio.get_running_loop()
+
+    class Indexer:
+        async def sync(self, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    class QdrantClient:
+        async def close(self):
+            assert asyncio.get_running_loop() is owner
+            assert cancelled.is_set()
+            closed.set()
+
+    store = FakeStore()
+    store.client = QdrantClient()
+    monkeypatch.setattr(cli, "ensure_qdrant", lambda _: None)
+    monkeypatch.setattr(cli, "_dependencies", lambda _: (store, OperationLog(settings.runtime_dir), {"test": Indexer()}))
+    application = daemon.create_daemon_application(settings)
+    async with Client(application.mcp):
+        await asyncio.wait_for(started.wait(), 3)
+    assert cancelled.is_set() and closed.is_set()
+    assert (await application.status())["last_error"] == "sync_cancelled"
+    assert application.operation_log.index_status()["error_code"] == "sync_cancelled"
+
+
+@pytest.mark.anyio
+async def test_initial_and_manual_sync_share_writer_queue_and_keep_model_status(settings, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from fastmcp import Client
+    from knowledge_mcp import cli, daemon
+    from knowledge_mcp.indexer import IndexRunSummary
+    from knowledge_mcp.state import OperationLog
+    from test_server import FakeStore
+
+    initial = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    active = 0
+
+    class Indexer:
+        async def sync(self, **kwargs):
+            nonlocal calls, active
+            calls += 1
+            active += 1
+            assert active == 1
+            try:
+                initial.set()
+                await release.wait()
+                await asyncio.sleep(.03)
+                log.record_index(collection_name=settings.collection_name, generation=None, added=1, changed=0, deleted=0)
+                return IndexRunSummary(added=1)
+            finally:
+                active -= 1
+
+    class QdrantClient:
+        async def count(self, collection, exact):
+            return SimpleNamespace(count=7)
+        async def close(self):
+            pass
+
+    store = FakeStore()
+    store.stores = {"test": SimpleNamespace(settings=settings, client=QdrantClient(), embedding_provider=store.embedding_provider)}
+    store.reranker = SimpleNamespace(model_name="test-reranker", loaded=False)
+    log = OperationLog(settings.runtime_dir)
+    monkeypatch.setattr(cli, "ensure_qdrant", lambda _: None)
+    monkeypatch.setattr(cli, "_dependencies", lambda _: (store, log, {"test": Indexer()}))
+    application = daemon.create_daemon_application(settings)
+    async with Client(application.mcp) as client:
+        await asyncio.wait_for(initial.wait(), 2)
+        first = asyncio.create_task(client.call_tool("knowledge-index-sync", {}))
+        second = asyncio.create_task(client.call_tool("knowledge-index-sync", {}))
+        await asyncio.sleep(.05)
+        assert calls == 1
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 3)
+        assert calls == 3
+        status = (await client.call_tool("knowledge-index-status", {})).data
+        assert status["state"] == "ready"
+        assert status["models"]["test"]["point_count"] == 7
+        assert status["models"]["test"]["status"] == "completed"
+        assert status["reranker"]["model"] == "test-reranker"
 
 
 def test_daemon_logging_restores_streams_and_handlers_after_failure(tmp_path, capsys):

@@ -123,11 +123,75 @@ async def test_sync_accepts_outer_index_lock(tmp_path, monkeypatch):
     def unexpected_lock(_runtime_dir):
         raise AssertionError("sync acquired a second index lock")
 
-    monkeypatch.setattr(module, "index_lock", unexpected_lock)
+    monkeypatch.setattr(module, "async_index_lock", unexpected_lock)
     with index_lock(settings.runtime_dir):
         result = await indexer.sync(assume_locked=True)
 
     assert (result.added, result.failed) == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_waiting_writer_cancellation_does_not_leak_file_lock(tmp_path):
+    import asyncio
+    from knowledge_mcp.state import async_index_lock
+
+    entered = asyncio.Event()
+
+    async def writer():
+        async with async_index_lock(tmp_path):
+            entered.set()
+
+    with index_lock(tmp_path):
+        task = asyncio.create_task(writer())
+        await asyncio.sleep(.15)
+        assert not entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await asyncio.wait_for(writer(), 1)
+    assert entered.is_set()
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_drains_thread_before_releasing_writer(tmp_path):
+    import asyncio
+    import threading
+    from knowledge_mcp.state import async_index_lock, run_blocking
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    entered = asyncio.Event()
+
+    def commit():
+        started.set()
+        release.wait(5)
+        finished.set()
+
+    async def writer():
+        async with async_index_lock(tmp_path):
+            await run_blocking(commit)
+
+    async def next_writer():
+        async with async_index_lock(tmp_path):
+            entered.set()
+
+    task = asyncio.create_task(writer())
+    second = None
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(.02)
+        task.cancel()
+        second = asyncio.create_task(next_writer())
+        await asyncio.sleep(.15)
+        assert not entered.is_set(), "writer lock released while thread is still committing"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        await asyncio.wait_for(second, 1)
+    finally:
+        release.set()
+        await asyncio.gather(task, *([second] if second else []), return_exceptions=True)
 
 
 def fail(*args, **kwargs):

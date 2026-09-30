@@ -21,6 +21,80 @@ from mcp_test_helpers import serve_http
 from test_server import FakeStore
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_slow_bootstrap_and_parser_keep_health_discovery_and_status_live(tmp_path, monkeypatch, mode):
+    import asyncio
+    import threading
+    from knowledge_mcp import cli, daemon
+    from knowledge_mcp.documents import parse_source
+    from knowledge_mcp.indexer import KnowledgeIndexer
+    from test_indexer import WordTokenizer
+
+    settings = Settings(tmp_path / "vault", tmp_path / "runtime", Settings.DEFAULT_QDRANT_URL,
+                        "slow-wire", Settings.DEFAULT_DENSE_MODEL, "test", project_root=tmp_path)
+    settings.vault_root.mkdir()
+    (settings.vault_root / "sample.md").write_text("# Example\nBody", encoding="utf-8")
+    bootstrap_release, parse_release = threading.Event(), threading.Event()
+    parsing = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    class IndexStore:
+        async def ensure_schema(self):
+            assert asyncio.get_running_loop() is loop
+        async def replace_generation(self, *args, **kwargs):
+            assert asyncio.get_running_loop() is loop
+            return ["point"]
+        async def generation_matches(self, *args):
+            return True
+        async def cleanup_orphans(self, generations):
+            pass
+
+    def parser(path, selected):
+        parsing.set()
+        assert parse_release.wait(8), "test did not release parser"
+        return parse_source(path, selected)
+
+    def dependencies(selected):
+        log = OperationLog(selected.runtime_dir)
+        return FakeStore(), log, {"test": KnowledgeIndexer(selected, IndexStore(), WordTokenizer(),
+                                                            operation_log=log, parser=parser)}
+
+    monkeypatch.setattr(cli, "ensure_qdrant", lambda _: bootstrap_release.wait(8))
+    monkeypatch.setattr(cli, "_dependencies", dependencies)
+    application = daemon.create_daemon_application(settings)
+    try:
+        async with serve_http(application.mcp) as url:
+            async with httpx2.AsyncClient() as http, Client(url, mode=mode) as client:
+                with anyio.fail_after(2):
+                    assert (await http.get(url.replace("/mcp", "/health"))).json()["status"] == "starting"
+                    assert len(await client.list_tools()) == 3
+                    assert (await client.call_tool("knowledge-index-status", {})).data["state"] == "starting"
+                    starting = await client.call_tool("qdrant-find", {"query": "query"}, raise_on_error=False)
+                    assert starting.is_error and "starting" in starting.content[0].text
+                bootstrap_release.set()
+                with anyio.fail_after(3):
+                    while not parsing.is_set():
+                        await anyio.sleep(.01)
+                with anyio.fail_after(2):
+                    assert (await http.get(url.replace("/mcp", "/health"))).json()["status"] == "indexing"
+                    assert len(await client.list_tools()) == 3
+                    status = (await client.call_tool("knowledge-index-status", {})).data
+                    assert status["state"] == "indexing"
+                    assert status["progress"]["test"]["total"] == 1
+                    result = await client.call_tool("qdrant-find", {"query": "query"}, raise_on_error=False)
+                    assert result.is_error and "indexing" in result.content[0].text
+                parse_release.set()
+                with anyio.fail_after(3):
+                    while (await client.call_tool("knowledge-index-status", {})).data["state"] != "ready":
+                        await anyio.sleep(.01)
+                assert not (await client.call_tool("qdrant-find", {"query": "query"})).is_error
+                assert (await client.call_tool("knowledge-index-status", {})).data["last_completed"]
+    finally:
+        bootstrap_release.set()
+        parse_release.set()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

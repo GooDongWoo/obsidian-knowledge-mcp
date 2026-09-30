@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+import asyncio
+from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -228,6 +229,57 @@ def index_lock(runtime_dir: Path, *, lock_name: str = "index.lock") -> Iterator[
         finally:
             lock_file.seek(0)
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@asynccontextmanager
+async def async_index_lock(runtime_dir: Path):
+    """Wait cooperatively; cancellation never leaves a worker acquiring a lock."""
+    directory = Path(runtime_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "index.lock").open("a+b") as lock_file:
+        lock_file.seek(0)
+        while True:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                await asyncio.sleep(0.1)
+        try:
+            if lock_file.seek(0, 2) == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            yield
+        finally:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+async def run_blocking(function, /, *args, **kwargs):
+    """Finish an in-flight thread operation before releasing its owner/lock."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A thread cannot be cancelled. In particular, a manifest commit must
+        # finish before another writer can enter or shutdown closes clients.
+        try:
+            await finish_thread(task)
+        except Exception:
+            pass
+        raise
+
+
+async def finish_thread(task):
+    """Drain owned thread work even when request and shutdown both cancel it."""
+    import anyio
+
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
 
 
 @contextmanager

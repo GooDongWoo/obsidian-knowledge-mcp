@@ -11,7 +11,7 @@ from typing import Any, Callable
 from .config import Settings
 from .documents import SourceDocument, chunk_document, discover_sources, parse_source
 from .qdrant_store import BM25_OPTIONS, KnowledgeStore
-from .state import Manifest, OperationLog, index_lock
+from .state import Manifest, OperationLog, async_index_lock, run_blocking
 
 
 # Bump the implementation version whenever parsing/chunking semantics change.
@@ -45,10 +45,12 @@ class KnowledgeIndexer:
         self.manifest = manifest if manifest is not None else Manifest(settings.runtime_dir, settings.collection_name)
         self.operation_log = operation_log if operation_log is not None else OperationLog(settings.runtime_dir)
         self.parser = parser
+        self.progress = {"stage": "idle", "completed": 0, "total": 0}
 
     async def sync(self, *, assume_locked: bool = False) -> IndexRunSummary:
         """Serialize writers unless caller holds the index lock; store no document bodies."""
         summary = IndexRunSummary()
+        self.progress = {"stage": "waiting", "completed": 0, "total": 0}
         try:
             return await self._sync(summary, assume_locked=assume_locked)
         except asyncio.CancelledError:
@@ -56,31 +58,31 @@ class KnowledgeIndexer:
             # commit. Preserve recovery inputs and don't leave an old success
             # as the reported outcome of this interrupted run.
             self._failure(summary, "sync_cancelled")
-            self._record(summary)
+            await run_blocking(self._record, summary)
             raise
+        finally:
+            self.progress["stage"] = "idle"
 
     async def _sync(self, summary: IndexRunSummary, *, assume_locked: bool) -> IndexRunSummary:
-        with nullcontext() if assume_locked else index_lock(self.settings.runtime_dir):
+        async with nullcontext() if assume_locked else async_index_lock(self.settings.runtime_dir):
             stage = "schema_check_failed"
             try:
                 await self.store.ensure_schema()
                 stage = "discovery_failed"
-                sources = {
-                    path.relative_to(self.settings.vault_root.resolve()).as_posix(): path
-                    for path in discover_sources(self.settings)
-                }
+                sources = await run_blocking(self._sources)
+                self.progress = {"stage": "indexing", "completed": 0, "total": len(sources)}
                 stage = "manifest_read_failed"
-                completed = self.manifest.completed_files()
+                completed = await run_blocking(self.manifest.completed_files)
             except Exception:
                 self._failure(summary, stage)
-                self._record(summary)
+                await run_blocking(self._record, summary)
                 return summary
 
             cleanup_allowed = True
             for source_path, path in sources.items():
                 stage = "source_read_failed"
                 try:
-                    file_hash, generation = self._fingerprint(path)
+                    file_hash, generation = await run_blocking(self._fingerprint, path)
                     previous = completed.get(source_path)
                     stage = "generation_check_failed"
                     if previous and previous.generation == generation and await self.store.generation_matches(
@@ -89,14 +91,14 @@ class KnowledgeIndexer:
                         summary.unchanged += 1
                         continue
                     stage = "parse_failed"
-                    document = self.parser(path, self.settings)
+                    document = await run_blocking(self.parser, path, self.settings)
                     if document.status not in {"ready", "skipped_no_text", "skipped_large_file"}:
                         self._failure(summary, "parse_failed")
                         continue
                     stage = "chunk_failed"
-                    chunks = chunk_document(document, self.tokenizer, max_tokens=400, overlap_tokens=60)
+                    chunks = await run_blocking(chunk_document, document, self.tokenizer, max_tokens=400, overlap_tokens=60)
                     stage = "source_changed_during_parse"
-                    if self._fingerprint(path) != (file_hash, generation):
+                    if await run_blocking(self._fingerprint, path) != (file_hash, generation):
                         self._failure(summary, stage)
                         continue
                     stage = "qdrant_replace_failed"
@@ -104,7 +106,7 @@ class KnowledgeIndexer:
                         source_path, generation, chunks, file_hash=file_hash,
                     )
                     stage = "manifest_commit_failed"
-                    self.manifest.mark_complete(source_path, file_hash, generation, len(point_ids), point_ids)
+                    await run_blocking(self.manifest.mark_complete, source_path, file_hash, generation, len(point_ids), point_ids)
                     if document.status in {"skipped_no_text", "skipped_large_file"}:
                         summary.skipped += 1
                     elif previous:
@@ -115,13 +117,16 @@ class KnowledgeIndexer:
                     self._failure(summary, stage)
                     if stage == "manifest_commit_failed":
                         cleanup_allowed = False
+                finally:
+                    self.progress["completed"] += 1
 
+            self.progress["stage"] = "cleanup"
             for source_path in sorted(set(completed) - set(sources)):
                 stage = "qdrant_delete_failed"
                 try:
                     await self.store.delete_source(source_path)
                     stage = "manifest_remove_failed"
-                    self.manifest.remove(source_path)
+                    await run_blocking(self.manifest.remove, source_path)
                     summary.deleted += 1
                 except Exception:
                     self._failure(summary, stage)
@@ -131,7 +136,7 @@ class KnowledgeIndexer:
             if cleanup_allowed:
                 stage = "orphan_cleanup_failed"
                 try:
-                    committed = self.manifest.completed_files()
+                    committed = await run_blocking(self.manifest.completed_files)
                     for source_path, entry in committed.items():
                         if not await self.store.generation_matches(
                             source_path, entry.generation, entry.point_count, entry.point_ids,
@@ -142,8 +147,12 @@ class KnowledgeIndexer:
                         await self.store.cleanup_orphans({path: entry.generation for path, entry in committed.items()})
                 except Exception:
                     self._failure(summary, stage)
-            self._record(summary)
+            await run_blocking(self._record, summary)
         return summary
+
+    def _sources(self) -> dict[str, Path]:
+        root = self.settings.vault_root.resolve()
+        return {path.relative_to(root).as_posix(): path for path in discover_sources(self.settings)}
 
     def _fingerprint(self, path: Path) -> tuple[str, str]:
         file_hash = sha256(path.read_bytes()).hexdigest()

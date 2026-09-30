@@ -16,13 +16,13 @@ from .config import Settings, _load_env_file
 _load_env_file()
 
 from .daemon import (
+    create_daemon_application,
     get_daemon_pid,
     is_daemon_running,
     run_daemon,
     start_daemon_process,
     stop_daemon_process,
 )
-from .server import create_application
 from .state import Manifest, OperationLog, index_lock
 
 
@@ -167,24 +167,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if command == "serve":
             if getattr(args, "standalone", False):
-                # Standalone mode owns its models in this process.
-                ensure_qdrant(settings)
-                store, operation_log, indexers = _dependencies(settings)
-
-                async def sync_all_standalone() -> bool:
-                    summaries = {model: await indexer.sync() for model, indexer in indexers.items()}
-                    for model, summary in summaries.items():
-                        print(f"{model}: {asdict(summary)}", file=sys.stderr)
-                    return all(summary.status == "completed" for summary in summaries.values())
-
-                async def run_standalone() -> None:
-                    await sync_all_standalone()
-                    if hasattr(store, "reranker") and hasattr(store.reranker, "warmup"):
-                        await asyncio.to_thread(store.reranker.warmup)
-                    application = create_application(settings, store, operation_log)
-                    await application.mcp.run_async(transport="stdio")
-
-                asyncio.run(run_standalone())
+                application = create_daemon_application(settings, sync_tool=False)
+                application.mcp.run(transport="stdio")
                 return 0
             else:
                 # Default mode: Ensure daemon is running and proxy stdio

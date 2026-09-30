@@ -226,7 +226,11 @@ The proxy's tool-call timeout defaults to 15 seconds (`KNOWLEDGE_PROXY_TIMEOUT` 
 
 Concurrent clients share a process startup lock, and sync calls queue asynchronously before taking the filesystem writer lock. Startup timeout terminates the owned unready process tree before releasing the startup lock. The proxy reuses its verified SSL context while the SDK creates independent backend sessions, avoiding repeated Windows trust-store loading without sharing protocol sessions.
 
-Model loading, initial incremental sync, and reranker warmup have a separate 900-second startup deadline (`KNOWLEDGE_DAEMON_START_TIMEOUT`). Keep the MCP client's startup timeout at least this long; the normal tool-call deadline remains 15 seconds.
+HTTP/MCP opens before Qdrant setup, model loading, initial incremental sync, and reranker warmup. `/health` returns HTTP 200 when the server is listening, with `status` set to `starting`, `indexing`, `ready`, or `error`; HTTP 200 does not imply search readiness. Discovery, the tool list, and `knowledge-index-status` remain available during startup and indexing. Status includes `state`, per-model `progress` counters, `last_completed`, and a stable `last_error`; model counts and index outcomes are snapshots refreshed after initialization/sync/warmup.
+
+During active indexing, `qdrant-find` returns an explicit indexing/retry tool error. Before models exist it reports starting or initialization failure. Once indexing stops, searches can use a valid existing collection even if the latest sync was partial; Qdrant connection errors are reported as search errors. Optional warmup failure is reported as `warmup_error` and leaves base retrieval available. Initial and manual sync share one writer queue. Shutdown cancels managed work, finishes any already-running file/SQLite/model thread operation, records interrupted sync, and closes Qdrant clients on their owning event loop. A native model operation already in progress can delay graceful shutdown.
+
+`KNOWLEDGE_DAEMON_START_TIMEOUT` (default 900 seconds) now bounds waiting for the HTTP listener, independently of model/index readiness. The proxy's normal tool-call deadline remains 15 seconds. `serve --standalone` uses the same managed initialization lifecycle while preserving its two read tools.
 
 ---
 

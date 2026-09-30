@@ -113,7 +113,7 @@ Qdrant 컨테이너가 꺼져 있으면 자동으로 시작하고, Vault와 인�
 # 데몬 상태 및 PID 확인
 & $mcp daemon status
 
-# 데몬 백그라운드 시작 (Qdrant 자동 확인 + 1회 동기화 + /mcp HTTP 서버 오픈)
+# 데몬 백그라운드 시작 (HTTP 먼저 오픈 → Qdrant 확인·모델 로딩·1회 동기화)
 & $mcp daemon start
 
 # 데몬 중지 (메모리 완전 해제)
@@ -220,7 +220,13 @@ Obsidian Vault에서 밀집 벡터(`BGE-m3-ko`)와 희소 BM25를 결합한 하�
 
 취소된 색인은 `partial`과 `sync_cancelled`를 기록하며 다음 일반 증분 동기화에서 manifest와 벡터 세대를 복구합니다. 여러 클라이언트의 데몬 시작은 프로세스 간 잠금으로 직렬화하고, 동시 sync 요청은 파일 잠금을 잡기 전에 비동기로 대기합니다. 시작 제한 시간을 넘긴 프로세스는 종료한 뒤 시작 잠금을 해제합니다. 프록시는 인증서 검증용 SSL context만 재사용하며 MCP 세션은 SDK가 요청별로 생성합니다.
 
-모델 로딩·최초 증분 동기화·리랭커 warmup에는 별도 시작 제한 900초를 적용합니다(`KNOWLEDGE_DAEMON_START_TIMEOUT`). MCP 클라이언트의 시작 제한도 이 값 이상으로 설정하세요. 일반 도구 호출 제한 15초와는 별개입니다.
+HTTP/MCP는 Qdrant 확인, 모델 로딩, 최초 증분 동기화, 리랭커 warmup 전에 열립니다. `/health`의 HTTP 200은 서버가 요청을 받는다는 뜻이며 검색 준비 완료를 의미하지 않습니다. 응답의 `status`는 `starting`, `indexing`, `ready`, `error` 중 하나입니다. 초기화·색인 중에도 discovery, 도구 목록, 상태 조회는 사용할 수 있습니다. `knowledge-index-status`는 `state`, 모델별 `progress` 진행 수, `last_completed`, 안정적인 `last_error` 코드를 제공합니다. 모델별 포인트 수와 색인 결과는 초기화·동기화·warmup 후 갱신한 스냅샷입니다.
+
+실제 색인 중에는 `qdrant-find`만 명시적인 “인덱싱 중, 잠시 후 재시도” 도구 오류를 반환합니다. 모델 준비 전에는 starting 또는 초기화 실패로 구분합니다. 색인이 끝나면 최근 동기화가 일부 실패했더라도 유효한 기존 컬렉션을 검색할 수 있습니다. Qdrant 연결 실패는 검색 오류로 반환되며 indexing으로 표시하지 않습니다. 선택적 warmup 실패는 `warmup_error`로 표시하고 기본 검색은 허용합니다.
+
+초기·수동 동기화는 하나의 writer 대기열을 공유합니다. 정상 종료 시 관리 작업을 취소하고, 이미 시작된 파일·SQLite·모델 스레드 작업을 완료한 뒤 중단 상태를 기록하고 Qdrant 클라이언트를 사용하던 이벤트 루프에서 닫습니다. 실행 중인 네이티브 모델 작업 때문에 정상 종료가 늦어질 수 있습니다. `serve --standalone`도 같은 초기화 수명주기를 사용하며 읽기 도구 두 개를 유지합니다.
+
+`KNOWLEDGE_DAEMON_START_TIMEOUT`의 기본 900초는 HTTP 서버가 열릴 때까지 기다리는 제한입니다. 모델·색인 준비 상태 및 일반 도구 호출 제한 15초와는 별개입니다.
 
 ---
 

@@ -141,3 +141,17 @@ async def test_default_model_follows_settings(settings):
     application = create_application(settings, store, OperationLog(settings.runtime_dir))
     await application.find(query="검색")
     assert store.request.embedding_model == "dragonkue/BGE-m3-ko"
+
+
+@pytest.mark.anyio
+async def test_connection_failure_after_index_failure_is_not_an_indexing_error(settings):
+    from knowledge_mcp.server import create_application
+
+    class DisconnectedStore:
+        async def hybrid_search(self, request):
+            raise ConnectionError("Qdrant is unavailable")
+
+    application = create_application(settings, DisconnectedStore(), OperationLog(settings.runtime_dir))
+    application.runtime_status = {"state": "error", "last_error": "schema_check_failed"}
+    with pytest.raises(ConnectionError, match="Qdrant is unavailable"):
+        await application.find(query="query")
