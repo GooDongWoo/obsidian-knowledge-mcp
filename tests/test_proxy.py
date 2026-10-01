@@ -1,10 +1,12 @@
 import subprocess
 import asyncio
 import sys
+import threading
 
 import anyio
 import pytest
 from fastmcp import Client, Context, FastMCP
+from mcp.shared.exceptions import MCPError
 
 from mcp_test_helpers import serve_http
 
@@ -59,12 +61,13 @@ async def test_offline_daemon_returns_tool_error_and_starts_only_once(monkeypatc
         import time
         time.sleep(0.2)
 
+    monkeypatch.setattr("knowledge_mcp.proxy.is_daemon_running", lambda **_: True)
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", restart)
     async with serve_http(backend) as url:
         proxy = create_stdio_proxy(url)
         async with Client(proxy) as client:
             await client.list_tools()
             monkeypatch.setattr("knowledge_mcp.proxy.is_daemon_running", lambda **_: False)
-            monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", restart)
             with anyio.fail_after(2):
                 first = await client.call_tool("echo", {}, raise_on_error=False)
                 second = await client.call_tool("echo", {}, raise_on_error=False)
@@ -101,14 +104,171 @@ async def test_timeout_does_not_replay_call_or_poison_next_request(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_unavailable_provider_is_an_error_instead_of_empty_tools():
+async def test_unavailable_provider_is_an_error_instead_of_empty_tools(monkeypatch):
     from knowledge_mcp.proxy import create_stdio_proxy
 
-    async with Client(create_stdio_proxy("http://127.0.0.1:1/mcp", timeout=0.1)) as client:
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", lambda *_, **__: None)
+    async with Client(create_stdio_proxy("http://127.0.0.1:1/mcp", timeout=0.1), mode="2026-07-28") as client:
         with pytest.raises(Exception) as failure:
             with anyio.fail_after(5):
                 await client.list_tools()
         assert not isinstance(failure.value, TimeoutError)
+
+
+@pytest.mark.anyio
+async def test_offline_list_discovery_and_call_share_restart_and_recover(monkeypatch):
+    from knowledge_mcp.proxy import create_stdio_proxy
+
+    backend = FastMCP("recovery")
+
+    @backend.tool
+    async def echo(text: str) -> str:
+        return text
+
+    alive = True
+    started, release = threading.Event(), threading.Event()
+    restarts = []
+
+    def restart(*args, **kwargs):
+        restarts.append(kwargs)
+        started.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr("knowledge_mcp.proxy.is_daemon_running", lambda **_: alive)
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", restart)
+    try:
+        async with serve_http(backend) as url:
+            proxy = create_stdio_proxy(url)
+            async with Client(proxy, mode="legacy") as legacy, Client(proxy) as modern:
+                assert [tool.name for tool in await legacy.list_tools()] == ["echo"]
+                assert [tool.name for tool in await modern.list_tools()] == ["echo"]
+                alive = False
+                with anyio.fail_after(3):
+                    results = await asyncio.gather(
+                        legacy.list_tools(), modern.session.send_discover("2026-07-28"),
+                        modern.call_tool("echo", {"text": "offline"}, raise_on_error=False),
+                        return_exceptions=True,
+                    )
+                    while not started.is_set():
+                        await anyio.sleep(.01)
+                for error in results[:2]:
+                    assert isinstance(error, MCPError)
+                    assert "재기동" in str(error)
+                assert results[2].is_error and "재기동" in results[2].content[0].text
+                assert len(restarts) == 1
+                alive = True
+                release.set()
+                assert [tool.name for tool in await legacy.list_tools()] == ["echo"]
+                assert [tool.name for tool in await modern.list_tools()] == ["echo"]
+                assert "capabilities" in await modern.session.send_discover("2026-07-28")
+                assert (await legacy.call_tool("echo", {"text": "recovered"})).data == "recovered"
+                assert (await modern.call_tool("echo", {"text": "recovered"})).data == "recovered"
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["list", "discover", "call"])
+async def test_backend_disappearing_after_health_probe_uses_restart_message(monkeypatch, method):
+    from knowledge_mcp.proxy import create_stdio_proxy
+
+    probes, restarts = [], []
+
+    def health(**kwargs):
+        probes.append(kwargs)
+        return len(probes) == 1
+
+    monkeypatch.setattr("knowledge_mcp.proxy.is_daemon_running", health)
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", lambda *_, **kw: restarts.append(kw))
+    proxy = create_stdio_proxy("http://127.0.0.1:1/mcp")
+    async with Client(proxy, mode="2026-07-28") as client:
+        with anyio.fail_after(5):
+            if method == "call":
+                result = await client.call_tool("echo", {}, raise_on_error=False)
+                assert result.is_error and "재기동" in result.content[0].text
+            else:
+                with pytest.raises(MCPError, match="재기동"):
+                    if method == "list":
+                        await client.list_tools()
+                    else:
+                        await client.session.send_discover("2026-07-28")
+            while not restarts:
+                await anyio.sleep(.01)
+        assert len(restarts) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["list", "discover", "call"])
+async def test_healthy_listener_with_failed_backend_session_returns_restart_error(monkeypatch, method):
+    from knowledge_mcp.proxy import create_stdio_proxy
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    class UnavailableSession:
+        def http_app(self, **kwargs):
+            async def health(request):
+                return JSONResponse({"status": "starting"})
+
+            async def unavailable(request):
+                return JSONResponse({"error": "fixture session unavailable"}, status_code=503)
+
+            return Starlette(routes=[Route("/health", health), Route("/mcp", unavailable, methods=["POST"])])
+
+    restarts = []
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", lambda *_, **kw: restarts.append(kw))
+    async with serve_http(UnavailableSession()) as url:
+        async with Client(create_stdio_proxy(url), mode="2026-07-28") as client:
+            with anyio.fail_after(5):
+                if method == "call":
+                    result = await client.call_tool("echo", {}, raise_on_error=False)
+                    assert result.is_error and "재기동" in result.content[0].text
+                else:
+                    with pytest.raises(MCPError, match="재기동"):
+                        if method == "list":
+                            await client.list_tools()
+                        else:
+                            await client.session.send_discover("2026-07-28")
+                while not restarts:
+                    await anyio.sleep(.01)
+            assert len(restarts) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_healthy_backend_validation_and_tool_errors_do_not_restart(monkeypatch, mode):
+    from knowledge_mcp.proxy import create_stdio_proxy
+    from fastmcp.server.middleware import Middleware
+    from starlette.responses import JSONResponse
+
+    class BackendValidation(Middleware):
+        async def on_call_tool(self, context, call_next):
+            if context.message.arguments["number"] == 0:
+                raise MCPError(code=-32602, message="fixture rejects zero")
+            return await call_next(context)
+
+    backend = FastMCP("errors", middleware=[BackendValidation()])
+
+    @backend.custom_route("/health", methods=["GET"])
+    async def health(request):
+        return JSONResponse({"status": "indexing"})
+
+    @backend.tool
+    async def echo(number: int) -> str:
+        raise ValueError("tool fixture failed")
+
+    restarts = []
+    monkeypatch.setattr("knowledge_mcp.proxy.start_daemon_process", lambda *_, **kw: restarts.append(kw))
+    async with serve_http(backend) as url:
+        async with Client(create_stdio_proxy(url), mode=mode) as client:
+            await client.list_tools()
+            invalid = await client.call_tool("echo", {"number": "bad"}, raise_on_error=False)
+            assert invalid.is_error and "재기동" not in invalid.content[0].text
+            remote_invalid = await client.call_tool("echo", {"number": 0}, raise_on_error=False)
+            assert remote_invalid.is_error and "재기동" not in remote_invalid.content[0].text
+            failure = await client.call_tool("echo", {"number": 1}, raise_on_error=False)
+            assert failure.is_error and "재기동" not in failure.content[0].text
+            assert restarts == []
 
 
 @pytest.mark.anyio

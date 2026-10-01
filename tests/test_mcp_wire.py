@@ -314,6 +314,76 @@ async def test_actual_stdio_proxy_discovery_search_and_eof(application, mode):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_stdio_proxy_session_failure_shares_restart_and_recovers(application, tmp_path, mode):
+    import asyncio
+    from starlette.responses import JSONResponse
+
+    offline = tmp_path / "session-offline"
+    restarts = tmp_path / "restarts"
+
+    @application.mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+        return JSONResponse({"status": "starting"})
+
+    class InterruptibleBackend:
+        def http_app(self, **kwargs):
+            upstream = application.mcp.http_app(**kwargs)
+
+            async def app(scope, receive, send):
+                if scope["type"] == "http" and scope["path"] == "/mcp" and offline.exists():
+                    await JSONResponse({"error": "owned fixture unavailable"}, status_code=503)(scope, receive, send)
+                else:
+                    await upstream(scope, receive, send)
+
+            return app
+
+    script = tmp_path / "proxy.py"
+    script.write_text(
+        "import anyio, sys, time\nfrom pathlib import Path\n"
+        "import knowledge_mcp.proxy as proxy\n"
+        f"offline=Path({str(offline)!r})\nrestarts=Path({str(restarts)!r})\n"
+        "def restart(*args, **kwargs):\n"
+        "    with restarts.open('a') as output: output.write('restart\\n')\n"
+        "    deadline=time.monotonic()+10\n"
+        "    while offline.exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+        "proxy.start_daemon_process=restart\n"
+        "anyio.run(proxy.run_stdio_proxy,sys.argv[1])\n", encoding="utf-8",
+    )
+    environment = {**os.environ, "FASTMCP_CHECK_FOR_UPDATES": "off", "FASTMCP_TELEMETRY_MODE": "off",
+                   "FASTMCP_SHOW_SERVER_BANNER": "false", "PYTHONIOENCODING": "utf-8"}
+    try:
+        async with serve_http(InterruptibleBackend()) as url:
+            transport = StdioTransport(command=sys.executable, args=[str(script), url], env=environment)
+            with anyio.fail_after(25):
+                async with Client(transport, mode=mode) as client:
+                    assert len(await client.list_tools()) == 2
+                    offline.touch()
+                    try:
+                        pending = [client.list_tools(), client.call_tool("qdrant-find", {"query": "offline"},
+                                                                        raise_on_error=False)]
+                        if mode == "auto":
+                            pending.append(client.session.send_discover("2026-07-28"))
+                        results = await asyncio.gather(*pending, return_exceptions=True)
+                        assert isinstance(results[0], MCPError) and "재기동" in str(results[0])
+                        assert results[1].is_error and "재기동" in results[1].content[0].text
+                        if mode == "auto":
+                            assert isinstance(results[2], MCPError) and "재기동" in str(results[2])
+                        while not restarts.exists():
+                            await anyio.sleep(.01)
+                        assert restarts.read_text().splitlines() == ["restart"]
+                    finally:
+                        offline.unlink(missing_ok=True)
+                    assert len(await client.list_tools()) == 2
+                    if mode == "auto":
+                        assert "capabilities" in await client.session.send_discover("2026-07-28")
+                    assert not (await client.call_tool("qdrant-find", {"query": "한글"})).is_error
+                    assert restarts.read_text().splitlines() == ["restart"]
+    finally:
+        offline.unlink(missing_ok=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
 async def test_standalone_cli_runs_real_stdio_protocol(tmp_path, mode):
     # Replace only external Qdrant/model work; execute the real CLI run path.
     script = tmp_path / "standalone.py"
