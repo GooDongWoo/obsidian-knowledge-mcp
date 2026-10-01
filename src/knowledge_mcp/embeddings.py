@@ -1,7 +1,7 @@
 """Local embedding providers for the supported dense models."""
 
-import asyncio
 import os
+import threading
 import warnings
 from typing import Sequence
 
@@ -11,6 +11,7 @@ from fastembed.common.types import Device
 
 from .config import DENSE_MODELS
 from .embedding_protocol import EmbeddingProvider, Tokenizer
+from .state import run_blocking
 
 
 def _limit_cpu_threads() -> None:
@@ -89,16 +90,14 @@ class LocalFastEmbedProvider(EmbeddingProvider):
             self.embedding_model = TextEmbedding(model_name, cuda=Device.CPU)
 
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
-        loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            None, lambda: list(self.embedding_model.passage_embed(documents, batch_size=32))
+        embeddings = await run_blocking(
+            lambda: list(self.embedding_model.passage_embed(documents, batch_size=32))
         )
         return [embedding.tolist() for embedding in embeddings]
 
     async def embed_query(self, query: str) -> list[float]:
-        loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            None, lambda: list(self.embedding_model.query_embed([query]))
+        embeddings = await run_blocking(
+            lambda: list(self.embedding_model.query_embed([query]))
         )
         return embeddings[0].tolist()
 
@@ -122,13 +121,15 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
         _limit_cpu_threads()
         self.model_name = model_name
         self._model = None
+        self._model_lock = threading.Lock()
 
     @property
     def model(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+        with self._model_lock:
+            if self._model is None:
+                from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name)
+                self._model = SentenceTransformer(self.model_name)
         return self._model
 
     def warmup(self) -> None:
@@ -136,27 +137,20 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
         _ = self.model
 
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
-        try:
-            vectors = await asyncio.to_thread(
-                self.model.encode, documents, batch_size=32, normalize_embeddings=True
-            )
-        except TypeError:
-            vectors = await asyncio.to_thread(
-                self.model.encode, documents, normalize_embeddings=True
-            )
+        vectors = await run_blocking(self._encode, documents)
         return vectors.tolist()
 
     async def embed_query(self, query: str) -> list[float]:
-        try:
-            vectors = await asyncio.to_thread(
-                self.model.encode, [query], batch_size=32, normalize_embeddings=True
-            )
-        except TypeError:
-            vectors = await asyncio.to_thread(
-                self.model.encode, [query], normalize_embeddings=True
-            )
+        vectors = await run_blocking(self._encode, [query])
         return vectors[0].tolist()
 
+    def _encode(self, documents: list[str]):
+        # Resolve the lazy model in the worker too: evaluating self.model.encode
+        # before dispatch would construct it on the event loop on first use.
+        try:
+            return self.model.encode(documents, batch_size=32, normalize_embeddings=True)
+        except TypeError:
+            return self.model.encode(documents, normalize_embeddings=True)
 
     def get_vector_name(self) -> str:
         return f"st-{self.model_name.split('/')[-1].lower()}"
