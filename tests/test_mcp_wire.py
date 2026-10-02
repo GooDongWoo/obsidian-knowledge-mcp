@@ -29,6 +29,7 @@ async def test_slow_bootstrap_and_parser_keep_health_discovery_and_status_live(t
     from knowledge_mcp import cli, daemon
     from knowledge_mcp.documents import parse_source
     from knowledge_mcp.indexer import KnowledgeIndexer
+    from knowledge_mcp.qdrant_store import CollectionInventory
     from test_indexer import WordTokenizer
 
     settings = Settings(tmp_path / "vault", tmp_path / "runtime", Settings.DEFAULT_QDRANT_URL,
@@ -45,9 +46,12 @@ async def test_slow_bootstrap_and_parser_keep_health_discovery_and_status_live(t
         async def replace_generation(self, *args, **kwargs):
             assert asyncio.get_running_loop() is loop
             return ["point"]
+        async def collection_inventory(self):
+            assert asyncio.get_running_loop() is loop
+            return CollectionInventory()
         async def generation_matches(self, *args):
             return True
-        async def cleanup_orphans(self, generations):
+        async def cleanup_orphans(self, generations, *, inventory):
             pass
 
     def parser(path, selected):
@@ -208,7 +212,7 @@ async def test_real_http_search_contract_and_protocol_metadata(application, mode
             assert schema["required"] == ["query"]
             assert schema["properties"]["include_private"]["default"] is False
             assert schema["properties"]["limit"]["default"] == 8
-            assert schema["properties"]["rerank"]["default"] is False
+            assert schema["properties"]["rerank"]["default"] is True
             result = await client.call_tool("qdrant-find", {"query": "프로젝트 알파"})
             data = result.data
             if isinstance(data, dict):
@@ -405,3 +409,49 @@ async def test_standalone_cli_runs_real_stdio_protocol(tmp_path, mode):
             assert {t.name for t in await client.list_tools()} == {"qdrant-find", "knowledge-index-status"}
             status = await client.call_tool("knowledge-index-status", {})
             assert status.data["collection"] == "standalone"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+@pytest.mark.parametrize("policy,applied,error", [
+    ("default", True, None),
+    ("false", False, None),
+    ("init", False, "reranker_init_failed"),
+    ("inference", False, "reranker_inference_failed"),
+    ("invalid", False, "reranker_invalid_scores"),
+])
+async def test_reranking_outcomes_keep_text_and_structured_wire_contract(application, monkeypatch, mode, policy, applied, error):
+    from knowledge_mcp.retrieval import MultiModelStore
+    from test_retrieval import CandidateStore, result
+    from types import SimpleNamespace
+
+    class CrossEncoder:
+        def __init__(self, name, *, device):
+            if policy == "false":
+                pytest.fail("explicit false constructed model")
+            if policy == "init":
+                raise RuntimeError("private init payload")
+        def predict(self, pairs):
+            if policy == "inference":
+                raise RuntimeError("private inference payload")
+            return [.2, .8] if policy == "default" else [float("nan")]
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
+    application.store = MultiModelStore({application.settings.dense_model: CandidateStore([
+        result("a", "one.md", .9), result("b", "two.md", .1)])})
+    async with serve_http(application.mcp) as url:
+        async with Client(url, mode=mode) as client:
+            arguments = {"query": "q"}
+            if policy == "false":
+                arguments["rerank"] = False
+            response = await client.call_tool("qdrant-find", arguments)
+            assert not response.is_error
+            data = response.data
+            if isinstance(data, dict):
+                data = data["result"]
+            assert [item["point_id"] for item in data] == (["b", "a"] if applied else ["a", "b"])
+            assert [item["score"] for item in data] == ([.8, .2] if applied else [.9, .1])
+            assert all(item["rerank_requested"] is (policy != "false") for item in data)
+            assert all(item["rerank_applied"] is applied and item["rerank_error"] == error for item in data)
+            assert [json.loads(block.text) for block in response.content] == data

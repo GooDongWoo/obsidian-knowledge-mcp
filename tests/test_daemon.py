@@ -262,7 +262,9 @@ async def test_lifecycle_failures_are_visible_and_existing_search_remains_usable
             return IndexRunSummary(failed=1, error_codes=["schema_check_failed"]) if failure == "index" else IndexRunSummary()
 
     store = FakeStore()
-    store.reranker = type("Reranker", (), {"warmup": fail})()
+    store.reranker = type("Reranker", (), {
+        "warmup": fail, "model_name": "test-reranker", "loaded": False,
+    })()
     monkeypatch.setattr(cli, "ensure_qdrant", fail if failure == "bootstrap" else lambda _: None)
     monkeypatch.setattr(cli, "_dependencies", lambda _: (store, OperationLog(settings.runtime_dir), {"test": Indexer()}))
     application = daemon.create_daemon_application(settings)

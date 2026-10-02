@@ -234,6 +234,9 @@ async def test_lifespan_keeps_index_client_open_until_encoding_finishes(tmp_path
         async def count(self, *args, **kwargs):
             return SimpleNamespace(count=0)
 
+        async def scroll(self, *args, **kwargs):
+            return [], None
+
         async def close(self):
             closed.set()
 

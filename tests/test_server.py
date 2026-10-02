@@ -39,7 +39,7 @@ async def test_find_tool_returns_source_location_and_logs_only_metrics(settings)
     assert "codex" not in db_text
     assert "note.md" not in db_text
     with sqlite3.connect(settings.runtime_dir / "state.sqlite3") as connection:
-        assert connection.execute("SELECT result_count, rerank_requested, rerank_applied FROM queries").fetchall() == [(1, 0, None)]
+        assert connection.execute("SELECT result_count, rerank_requested, rerank_applied FROM queries").fetchall() == [(1, 1, 0)]
 
 
 @pytest.mark.anyio
@@ -121,7 +121,7 @@ async def test_status_reports_each_model_collection(settings):
     application = create_application(settings, store, log)
     result = await application.status()
     assert result["models"]["dragonkue/BGE-m3-ko"]["point_count"] == 11
-    assert result["reranker"] == {"model": "dragonkue/bge-reranker-v2-m3-ko", "loaded": False}
+    assert result["reranker"] == {"model": "dragonkue/bge-reranker-v2-m3-ko", "loaded": False, "device": None, "last_fallback": None}
     assert result["collection"] == "bge"
     assert result["point_count"] == 11
     assert result["status"] == "completed"
@@ -155,3 +155,64 @@ async def test_connection_failure_after_index_failure_is_not_an_indexing_error(s
     application.runtime_status = {"state": "error", "last_error": "schema_check_failed"}
     with pytest.raises(ConnectionError, match="Qdrant is unavailable"):
         await application.find(query="query")
+
+
+@pytest.mark.anyio
+async def test_cached_status_refreshes_current_reranker_without_index_reads(settings, monkeypatch):
+    from knowledge_mcp.server import create_application
+    from knowledge_mcp.retrieval import MultiModelStore
+    from test_retrieval import CandidateStore, result
+    from types import SimpleNamespace
+    import sys
+
+    class CrossEncoder:
+        def __init__(self, name, *, device):
+            pass
+        def predict(self, pairs):
+            raise RuntimeError("private inference payload")
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
+    store = MultiModelStore({settings.dense_model: CandidateStore([result("a", "one", .9)])})
+    application = create_application(settings, store, OperationLog(settings.runtime_dir))
+    application.runtime_status = {"state": "ready"}
+    application.index_snapshot = {"reranker": {"loaded": False}, "point_count": 17}
+    await application.find(query="q")
+    status = await application.status()
+    assert status["point_count"] == 17
+    assert status["reranker"] == {"model": store.reranker.model_name, "loaded": True, "device": "cpu", "last_fallback": "reranker_inference_failed"}
+
+
+@pytest.mark.anyio
+async def test_concurrent_metrics_use_result_outcomes_and_keep_payloads_private(settings):
+    import asyncio
+    from knowledge_mcp.server import create_application
+    from test_retrieval import result
+
+    class Store:
+        async def hybrid_search(self, request):
+            await asyncio.sleep(0)
+            if request.query == "private success":
+                return [result("private_id", "private.md", .5).model_copy(update={"rerank_requested": True, "rerank_applied": True})]
+            return [result("private_id", "private.md", .9).model_copy(update={"rerank_requested": True, "rerank_applied": False, "rerank_error": "reranker_inference_failed"})]
+
+    application = create_application(settings, Store(), OperationLog(settings.runtime_dir))
+    await asyncio.gather(application.find(query="private success"), application.find(query="private fallback"))
+    with sqlite3.connect(settings.runtime_dir / "state.sqlite3") as connection:
+        rows = connection.execute("SELECT result_count, rerank_requested, rerank_applied, error_code FROM queries").fetchall()
+    assert sorted(rows, key=lambda row: row[2]) == [(1, 1, 0, "reranker_inference_failed"), (1, 1, 1, None)]
+    assert "private" not in application.operation_log.database_text_for_test()
+
+
+@pytest.mark.anyio
+async def test_empty_search_logs_requested_without_inventing_application(settings):
+    from knowledge_mcp.server import create_application
+
+    class Store:
+        async def hybrid_search(self, request):
+            return []
+
+    application = create_application(settings, Store(), OperationLog(settings.runtime_dir))
+    assert await application.find(query="q") == []
+    with sqlite3.connect(settings.runtime_dir / "state.sqlite3") as connection:
+        assert connection.execute("SELECT rerank_requested, rerank_applied, error_code FROM queries").fetchall() == [(1, 0, None)]

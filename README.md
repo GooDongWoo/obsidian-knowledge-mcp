@@ -37,7 +37,7 @@ To permanently solve these resource bottlenecks, the architecture was restructur
 - **Dense Vector Search**: Powered by `dragonkue/BGE-m3-ko` (1024 dimensions) for deep semantic matching.
 - **Sparse BM25 Index**: Built directly inside Qdrant to capture exact technical terms, symbols, and code identifiers.
 - **Reciprocal Rank Fusion (RRF)**: Merges dense and sparse candidates into a unified rank.
-- **Cross-Encoder Re-ranking**: Optional second-stage re-ranking via `dragonkue/bge-reranker-v2-m3-ko` running on CPU to ensure high relevance without consuming GPU VRAM.
+- **Cross-Encoder Re-ranking**: Second-stage re-ranking defaults to enabled via `dragonkue/bge-reranker-v2-m3-ko`, using CUDA when available and CPU when CUDA is unavailable or initialization fails.
 
 ---
 
@@ -72,7 +72,7 @@ To permanently solve these resource bottlenecks, the architecture was restructur
          ▼
 [ Single HTTP Daemon (Port 8765, /health) ]
    ├── BGE-m3-ko Embedding Model (GPU / CUDA)
-   ├── bge-reranker-v2-m3-ko (CPU Warmup)
+   ├── bge-reranker-v2-m3-ko (CUDA/CPU Warmup)
    └── FastMCP Tools: qdrant-find, knowledge-index-status, knowledge-index-sync
          │
          ├──> [ Local Docker Qdrant ] (Port 6333 / 6334)
@@ -218,7 +218,7 @@ During cutover, close the old clients/proxies, stop the old daemon, and confirm 
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| `qdrant-find` | Hybrid semantic + BM25 search across your Vault. | `query` (str, required)<br>`document_type` (list[str])<br>`file_type` (`["md", "txt", "pdf"]`)<br>`created_from`/`created_to` (`YYYY-MM-DD`)<br>`include_private` (bool, default: `false`)<br>`rerank` (bool, default: `false`)<br>`limit` (int, default: 8) |
+| `qdrant-find` | Hybrid semantic + BM25 search across your Vault. | `query` (str, required)<br>`document_type` (list[str])<br>`file_type` (`["md", "txt", "pdf"]`)<br>`created_from`/`created_to` (`YYYY-MM-DD`)<br>`include_private` (bool, default: `false`)<br>`rerank` (bool, default: `true`)<br>`limit` (int, default: 8) |
 | `knowledge-index-status` | Inspect indexing health, point counts, and errors. | *None* |
 | `knowledge-index-sync` | Trigger an on-demand incremental sync from chat. | `rebuild` (bool, default: `false`) |
 
@@ -227,6 +227,10 @@ The proxy's tool-call timeout defaults to 15 seconds (`KNOWLEDGE_PROXY_TIMEOUT` 
 Concurrent clients share a process startup lock, and sync calls queue asynchronously before taking the filesystem writer lock. Startup timeout terminates the owned unready process tree before releasing the startup lock. The proxy reuses its verified SSL context while the SDK creates independent backend sessions, avoiding repeated Windows trust-store loading without sharing protocol sessions.
 
 HTTP/MCP opens before Qdrant setup, model loading, initial incremental sync, and reranker warmup. `/health` returns HTTP 200 when the server is listening, with `status` set to `starting`, `indexing`, `ready`, or `error`; HTTP 200 does not imply search readiness. Discovery, the tool list, and `knowledge-index-status` remain available during startup and indexing. Status includes `state`, per-model `progress` counters, `last_completed`, and a stable `last_error`; model counts and index outcomes are snapshots refreshed after initialization/sync/warmup.
+
+Search requests default to `rerank=true`; explicit `false` preserves RRF ranking and does not load the reranker during search. CUDA initialization failure triggers one CPU construction retry. Successful CPU reranking reports `rerank_applied=true`. If initialization, inference, or score validation fails, search returns the original RRF scores/order with `rerank_requested=true`, `rerank_applied=false`, and `rerank_error` set to `reranker_init_failed`, `reranker_inference_failed`, or `reranker_invalid_scores`. Initialization failure is cached for the reranker instance; restart the daemon to retry loading. Inference and score failures can recover on the next search. Each result carries these fields in both the per-result text output and structured `{"result": [...]}` envelope. Scores are raw cross-encoder relevance scores only when `rerank_applied=true`; source caps and the final limit are applied after ranking. Empty searches do not apply or load the reranker.
+
+Status includes the actual reranker `device` (`cuda`, `cpu`, or `null` before successful initialization), `loaded`, and `last_fallback`. The fallback code distinguishes CPU selection (`reranker_cuda_unavailable` / `reranker_cuda_init_failed`) from an RRF fallback. A subsequent successful rerank resets the last inference/score failure to its device selection fallback, or `null` for CUDA. These lightweight fields refresh on each status request without querying Qdrant.
 
 During active indexing, `qdrant-find` returns an explicit indexing/retry tool error. Before models exist it reports starting or initialization failure. Once indexing stops, searches can use a valid existing collection even if the latest sync was partial; Qdrant connection errors are reported as search errors. Optional warmup failure is reported as `warmup_error` and leaves base retrieval available. Initial and manual sync share one writer queue. Shutdown cancels managed work, finishes any already-running file/SQLite/model thread operation, records interrupted sync, and closes Qdrant clients on their owning event loop. A native model operation already in progress can delay graceful shutdown.
 
@@ -238,7 +242,7 @@ During active indexing, `qdrant-find` returns an explicit indexing/retry tool er
 
 ### Local privacy and retention
 
-`state.sqlite3` records query timestamps, latency, result count, requested/applied reranking, and stable failure codes. Search text, filters, client names, result identifiers, paths, and excerpts are discarded. Until the retrieval layer reports actual application, `rerank_applied` is `NULL`; a request is not evidence of successful reranking. Query metrics expire after 30 days and are capped at 10,000 rows (`KNOWLEDGE_QUERY_RETENTION_DAYS`, `KNOWLEDGE_QUERY_MAX_ROWS`). Historical index runs expire after 30 days and are capped at 1,000 rows (`KNOWLEDGE_INDEX_RETENTION_DAYS`, `KNOWLEDGE_INDEX_MAX_ROWS`), with the newest status for each collection always retained in addition to that cap. Startup, operation writes, and status reads enforce retention. SQLite reuses freed pages and compacts substantial deletion backlogs. Manifest state remains durable and grows with the Vault.
+`state.sqlite3` records query timestamps, latency, result count, requested/applied reranking, and stable failure codes. Search text, filters, client names, result identifiers, paths, and excerpts are discarded. Successful searches record actual `rerank_applied` from their own results; explicit `false` and empty results record false. General search failures retain an unknown (`NULL`) applied outcome. A requested rerank is not evidence of successful reranking. Query metrics expire after 30 days and are capped at 10,000 rows (`KNOWLEDGE_QUERY_RETENTION_DAYS`, `KNOWLEDGE_QUERY_MAX_ROWS`). Historical index runs expire after 30 days and are capped at 1,000 rows (`KNOWLEDGE_INDEX_RETENTION_DAYS`, `KNOWLEDGE_INDEX_MAX_ROWS`), with the newest status for each collection always retained in addition to that cap. Startup, operation writes, and status reads enforce retention. SQLite reuses freed pages and compacts substantial deletion backlogs. Manifest state remains durable and grows with the Vault.
 
 The first initialization of an older database makes a consistent, one-time backup at `<runtime_dir>/state.pre-privacy.sqlite3`, migrates metrics, drops plaintext query/result data, scrubs legacy exception text, and runs `VACUUM`. Failed schema changes roll back and interrupted compaction is retried. The backup retains the old sensitive data and is never automatically deleted or overwritten. Its path is reported during migration; stop the daemon, verify index status, then manually remove the backup when recovery is no longer needed. To restore, stop every daemon/indexer, retain a copy of the current database, and copy the backup to `state.sqlite3` before running the previous checkout. Running this version on the restored database will migrate it again. External backups and filesystem recovery copies are outside this cleanup.
 

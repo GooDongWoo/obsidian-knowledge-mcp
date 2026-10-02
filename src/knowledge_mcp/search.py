@@ -14,7 +14,7 @@ class SearchRequest(BaseModel):
 
     query: str = Field(min_length=1)
     embedding_model: Literal["dragonkue/BGE-m3-ko"] = "dragonkue/BGE-m3-ko"
-    rerank: bool = False
+    rerank: bool = True
     document_type: list[str] | None = None
     file_type: list[str] | None = None
     created_from: date | None = None
@@ -49,7 +49,10 @@ class SearchResult(BaseModel):
     end_line: int | None = None
     page: int | None = None
     paragraph_index: int | None = None
-    score: float = Field(allow_inf_nan=False, description="Qdrant RRF fusion score, or raw CrossEncoder relevance score when rerank=True.")
+    score: float = Field(allow_inf_nan=False, description="RRF fusion score, or raw CrossEncoder relevance score when rerank_applied=True.")
+    rerank_requested: bool = False
+    rerank_applied: bool = False
+    rerank_error: Literal["reranker_init_failed", "reranker_inference_failed", "reranker_invalid_scores"] | None = None
 
 
 def search_filter(request: SearchRequest) -> models.Filter:

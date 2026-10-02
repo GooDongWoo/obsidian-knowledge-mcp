@@ -114,7 +114,7 @@ async def test_model_reads_selected_collection(tmp_path):
     try:
         await store.ensure_schema()
         await store.replace_generation("bge.md", "g1", [chunk("bge.md")], file_hash="a" * 64)
-        found = await router.hybrid_search(SearchRequest(query="프로젝트 알파", embedding_model=model))
+        found = await router.hybrid_search(SearchRequest(query="프로젝트 알파", embedding_model=model, rerank=False))
         assert {item.source_path for item in found} == {"bge.md"}
     finally:
         if await store.client.collection_exists(store.settings.collection_name):

@@ -38,7 +38,7 @@ class KnowledgeApplication:
         include_private: bool = False,
         limit: int = 8,
         embedding_model: Literal["dragonkue/BGE-m3-ko"] | None = None,
-        rerank: bool = False,
+        rerank: bool = True,
     ) -> list[dict[str, Any]]:
         from .search import SearchRequest, SearchResult
 
@@ -76,6 +76,8 @@ class KnowledgeApplication:
         await run_blocking(self.operation_log.record_query,
             results=results,
             rerank_requested=request.rerank,
+            rerank_applied=bool(results) and all(result.rerank_applied for result in results),
+            error_code=next((result.rerank_error for result in results if result.rerank_error), None),
             elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
         )
         return [result.model_dump() for result in results]
@@ -88,10 +90,20 @@ class KnowledgeApplication:
                 "collection": self.settings.collection_name, "dense_model": self.settings.dense_model,
                 **self.index_snapshot,
                 **self.runtime_status,
+                **self.reranker_status(),
                 "progress": {model: dict(getattr(indexer, "progress", {}))
                              for model, indexer in self.indexers.items()},
             }
         return await self.read_index_status()
+
+    def reranker_status(self) -> dict[str, Any]:
+        reranker = getattr(self.store, "reranker", None)
+        if reranker is None:
+            return {}
+        return {"reranker": getattr(reranker, "status", {
+            "model": reranker.model_name, "loaded": reranker.loaded,
+            "device": getattr(reranker, "device", None), "last_fallback": None,
+        })}
 
     async def read_index_status(self) -> dict[str, Any]:
         result = dict(await run_blocking(self.operation_log.index_status))
@@ -122,8 +134,7 @@ class KnowledgeApplication:
             if default_model is not None:
                 result.update({"collection": default_model["collection"],
                                "point_count": default_model["point_count"]})
-            reranker = self.store.reranker
-            result["reranker"] = {"model": reranker.model_name, "loaded": reranker.loaded}
+            result.update(self.reranker_status())
             return result
         provider = getattr(self.store, "embedding_provider", None)
         device = getattr(provider, "device", None)
@@ -147,7 +158,9 @@ def create_application(settings: Settings, store: Any = None, operation_log: Ope
     @mcp.tool(
         name="qdrant-find",
         description=("Search the local Obsidian Vault with dense plus BM25 hybrid retrieval. "
-                     "Scores are RRF fusion scores, or raw cross-encoder relevance scores when rerank is true."),
+                     "Reranking defaults to true. Scores are cross-encoder relevance scores when "
+                     "rerank_applied is true; otherwise RRF fusion scores. "
+                     "Results report rerank_requested, rerank_applied and stable rerank_error."),
     )
     async def qdrant_find(
         query: str,
@@ -160,7 +173,7 @@ def create_application(settings: Settings, store: Any = None, operation_log: Ope
         include_private: bool = False,
         limit: int = 8,
         embedding_model: Literal["dragonkue/BGE-m3-ko"] | None = None,
-        rerank: bool = False,
+        rerank: bool = True,
     ) -> list[dict[str, Any]]:
         results = await application.find(
             query=query,

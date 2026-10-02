@@ -18,7 +18,7 @@
          ▼
 [ Single HTTP Daemon (단일 백그라운드 프로세스, /health) ]
    ├── BGE-m3-ko 임베딩 (GPU / CUDA)
-   ├── bge-reranker-v2-m3-ko 리랭커 (CPU 워밍업)
+   ├── bge-reranker-v2-m3-ko 리랭커 (CUDA/CPU 워밍업)
    └── FastMCP 도구 제공 (qdrant-find, knowledge-index-status, knowledge-index-sync)
          │
          ├──> [ Docker Qdrant ] (127.0.0.1:6333, 6334)
@@ -198,7 +198,13 @@ Obsidian Vault에서 밀집 벡터(`BGE-m3-ko`)와 희소 BM25를 결합한 하�
 | `include_private` | bool | `false` | `true` 설정 시 비공개 문서 포함 |
 | `limit` | int | `8` | 반환할 청크 수 (1~20) |
 | `embedding_model` | string | `dragonkue/BGE-m3-ko` | 사용할 임베딩 모델 인덱스 |
-| `rerank` | bool | `false` | 한국어 Cross-Encoder(`bge-reranker-v2-m3-ko`) 적용 여부 |
+| `rerank` | bool | `true` | 한국어 Cross-Encoder(`bge-reranker-v2-m3-ko`) 적용 여부 |
+
+리랭크 기본값은 `true`입니다. 명시적 `false`는 RRF 순서를 보존하며 검색 중 리랭커를 로드하지 않습니다. CUDA를 사용할 수 없으면 CPU를 선택하고, CUDA 모델 초기화가 실패하면 CPU 초기화를 한 번 시도합니다. CPU 리랭크 성공도 `rerank_applied=true`입니다.
+
+초기화·추론·점수 검증 실패 시 기존 RRF 순서와 점수를 반환합니다. 각 결과의 `rerank_requested`, `rerank_applied`, `rerank_error`로 요청과 실제 적용을 구분합니다. 실패 코드는 각각 `reranker_init_failed`, `reranker_inference_failed`, `reranker_invalid_scores`이며 성공이나 명시적 false에는 오류 코드가 없습니다. 초기화 실패는 리랭커 인스턴스에 보존되므로 재초기화하려면 데몬을 재시작하세요. 추론·점수 실패는 다음 검색에서 다시 시도합니다. 점수는 `rerank_applied=true`일 때 CrossEncoder 원점수이고 그 외에는 RRF 점수입니다. 출처별 두 결과 제한과 최종 limit는 순위 결정 뒤 적용됩니다. 빈 결과는 리랭커를 로드하거나 적용하지 않습니다. 필드는 기존 결과별 텍스트와 구조화된 `{"result": [...]}` 양쪽 출력에 포함됩니다.
+
+상태의 리랭커 `device`는 실제 `cuda`/`cpu`이고 초기화 전 또는 초기화 실패 시 `null`입니다. `loaded`와 `last_fallback`도 제공합니다. CPU 선택 코드는 `reranker_cuda_unavailable` 또는 `reranker_cuda_init_failed`로 RRF 폴백과 구분됩니다. 이후 추론이 성공하면 최근 추론 실패 코드는 디바이스 선택 코드(CUDA 성공 시 null)로 돌아갑니다. 이 상태는 Qdrant를 다시 조회하지 않고 매 상태 요청에서 갱신합니다.
 
 **에이전트 대화창 호출 예시**:
 > "obsidian_knowledge의 qdrant-find로 'CUDA 가속' 관련 문서를 찾아줘. 출처 경로와 줄 번호도 포함해줘."  
@@ -249,7 +255,7 @@ docker compose -f (Join-Path $project 'docker-compose.yml') up -d
 
 ### 로컬 기록과 개인정보 보존 정책
 
-`state.sqlite3`의 질의 기록은 시각, 지연 시간, 결과 수, 리랭크 요청/적용 여부와 안정적인 실패 코드만 저장합니다. 검색어, 필터, 클라이언트명, 결과 ID, 결과 경로와 본문은 저장하지 않습니다. 실제 리랭크 적용 여부를 검색 계층에서 전달하기 전까지 `rerank_applied`는 `NULL`입니다. 요청값만으로 성공을 추정하지 않습니다.
+`state.sqlite3`의 질의 기록은 시각, 지연 시간, 결과 수, 리랭크 요청/적용 여부와 안정적인 실패 코드만 저장합니다. 검색어, 필터, 클라이언트명, 결과 ID, 결과 경로와 본문은 저장하지 않습니다. 성공한 검색은 해당 결과의 실제 `rerank_applied`를 기록합니다. 명시적 `false` 요청과 빈 결과는 적용 여부를 false로 기록하며, 일반 검색 실패의 적용 여부는 `NULL`로 남습니다. 요청값만으로 성공을 추정하지 않습니다.
 
 질의 지표는 기본 30일, 최대 10,000행을 보존합니다. `.env`의 `KNOWLEDGE_QUERY_RETENTION_DAYS`, `KNOWLEDGE_QUERY_MAX_ROWS`로 조절하며 0이나 잘못된 값은 기본값으로 돌아갑니다. 색인 이력은 기본 30일, 최대 1,000행을 보존합니다(`KNOWLEDGE_INDEX_RETENTION_DAYS`, `KNOWLEDGE_INDEX_MAX_ROWS`). 각 컬렉션의 최신 색인 상태는 이력 상한과 별도로 항상 유지합니다. 시작, 운영 기록 저장, 상태 조회 때 정리합니다. 작은 삭제는 SQLite 페이지를 재사용하고 큰 삭제는 `VACUUM`으로 줄입니다. 파일 manifest는 영구 색인 상태로 보존되어 Vault 크기에 따라 커질 수 있습니다.
 
