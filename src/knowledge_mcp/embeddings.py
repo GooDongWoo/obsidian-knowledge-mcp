@@ -9,20 +9,39 @@ import onnxruntime as ort
 from fastembed import TextEmbedding
 from fastembed.common.types import Device
 
-from .config import DENSE_MODELS
+from .config import DENSE_MODELS, Settings
 from .embedding_protocol import EmbeddingProvider, Tokenizer
 from .state import run_blocking
 
 
-def _limit_cpu_threads() -> None:
+_TORCH_RESOURCE_LOCK = threading.Lock()
+_MODEL_INFERENCE_LOCK = threading.Lock()
+_configured_cuda_budget = None
+
+
+def _limit_cpu_threads(threads: int = 4) -> None:
     """Cap PyTorch CPU thread usage to avoid CPU spikes during inference."""
     try:
         import torch
 
-        max_threads = min(4, os.cpu_count() or 4)
+        max_threads = min(threads, os.cpu_count() or 1)
         torch.set_num_threads(max_threads)
-    except Exception:
+    except ImportError:
         pass
+
+
+def configure_torch_resources(cpu_threads: int = 4, cuda_memory_fraction: float | None = None) -> None:
+    """Set process inference parallelism and optional CUDA allocator budget."""
+    global _configured_cuda_budget
+    import torch
+    with _TORCH_RESOURCE_LOCK:
+        if torch.get_num_threads() != min(cpu_threads, os.cpu_count() or 1):
+            _limit_cpu_threads(cpu_threads)
+        if cuda_memory_fraction is not None and torch.cuda.is_available():
+            budget = (torch.cuda, cuda_memory_fraction)
+            if _configured_cuda_budget != budget:
+                torch.cuda.set_per_process_memory_fraction(cuda_memory_fraction)
+                _configured_cuda_budget = budget
 
 
 class _FastEmbedTokenizer:
@@ -49,7 +68,6 @@ class _SentenceTransformerTokenizer:
 
 def prepare_cuda_runtime() -> None:
     """Load CUDA/cuDNN DLLs shipped by NVIDIA Python packages when available."""
-    _limit_cpu_threads()
     preload_dlls = getattr(ort, "preload_dlls", None)
     if preload_dlls is None:
         return
@@ -74,10 +92,16 @@ def select_device(available_providers: Sequence[str] | None = None) -> Device:
 class LocalFastEmbedProvider(EmbeddingProvider):
     """FastEmbed provider that prefers CUDA and safely falls back to CPU."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, *, settings: Settings | None = None):
+        self.batch_size = settings.embedding_batch_size if settings else 8
+        threads = min(settings.onnx_intra_op_num_threads if settings else 4, os.cpu_count() or 1)
+        options = {"arena_extend_strategy": settings.onnx_arena_extend_strategy if settings else "kSameAsRequested"}
+        if settings and settings.onnx_gpu_mem_limit is not None:
+            options["gpu_mem_limit"] = settings.onnx_gpu_mem_limit
         self.device = select_device()
         try:
-            self.embedding_model = TextEmbedding(model_name, cuda=self.device)
+            providers = [("CUDAExecutionProvider", options), "CPUExecutionProvider"] if self.device is Device.CUDA else ["CPUExecutionProvider"]
+            self.embedding_model = TextEmbedding(model_name, threads=threads, providers=providers, cuda=Device.CPU)
         except Exception:
             if self.device is not Device.CUDA:
                 raise
@@ -87,19 +111,20 @@ class LocalFastEmbedProvider(EmbeddingProvider):
                 stacklevel=2,
             )
             self.device = Device.CPU
-            self.embedding_model = TextEmbedding(model_name, cuda=Device.CPU)
+            self.embedding_model = TextEmbedding(model_name, threads=threads, providers=["CPUExecutionProvider"], cuda=Device.CPU)
 
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
-        embeddings = await run_blocking(
-            lambda: list(self.embedding_model.passage_embed(documents, batch_size=32))
-        )
+        embeddings = await run_blocking(self._embed, documents, False)
         return [embedding.tolist() for embedding in embeddings]
 
     async def embed_query(self, query: str) -> list[float]:
-        embeddings = await run_blocking(
-            lambda: list(self.embedding_model.query_embed([query]))
-        )
+        embeddings = await run_blocking(self._embed, [query], True)
         return embeddings[0].tolist()
+
+    def _embed(self, documents: list[str], query: bool):
+        with _MODEL_INFERENCE_LOCK:
+            method = self.embedding_model.query_embed if query else self.embedding_model.passage_embed
+            return list(method(documents, batch_size=self.batch_size))
 
     def get_vector_name(self) -> str:
         return f"fast-{self.embedding_model.model_name.split('/')[-1].lower()}"
@@ -117,8 +142,10 @@ class LocalFastEmbedProvider(EmbeddingProvider):
 class LocalSentenceTransformerProvider(EmbeddingProvider):
     """Korean BGE provider; load model only when first used."""
 
-    def __init__(self, model_name: str):
-        _limit_cpu_threads()
+    def __init__(self, model_name: str, *, settings: Settings | None = None):
+        self.batch_size = settings.embedding_batch_size if settings else 8
+        self.cpu_threads = settings.cpu_threads if settings else 4
+        self.cuda_memory_fraction = settings.cuda_memory_fraction if settings else None
         self.model_name = model_name
         self._model = None
         self._model_lock = threading.Lock()
@@ -127,6 +154,7 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
     def model(self):
         with self._model_lock:
             if self._model is None:
+                configure_torch_resources(self.cpu_threads, self.cuda_memory_fraction)
                 from sentence_transformers import SentenceTransformer
 
                 self._model = SentenceTransformer(self.model_name)
@@ -147,10 +175,8 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
     def _encode(self, documents: list[str]):
         # Resolve the lazy model in the worker too: evaluating self.model.encode
         # before dispatch would construct it on the event loop on first use.
-        try:
-            return self.model.encode(documents, batch_size=32, normalize_embeddings=True)
-        except TypeError:
-            return self.model.encode(documents, normalize_embeddings=True)
+        with _MODEL_INFERENCE_LOCK:
+            return self.model.encode(documents, batch_size=self.batch_size, normalize_embeddings=True)
 
     def get_vector_name(self) -> str:
         return f"st-{self.model_name.split('/')[-1].lower()}"
@@ -162,7 +188,9 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
         return _SentenceTransformerTokenizer(self.model.tokenizer)
 
 
-def create_embedding_provider(model_name: str) -> EmbeddingProvider:
+def create_embedding_provider(model_name: str, *, settings: Settings | None = None) -> EmbeddingProvider:
     if model_name == "dragonkue/BGE-m3-ko" or model_name in DENSE_MODELS:
-        return LocalSentenceTransformerProvider(model_name)
+        if settings is None:
+            return LocalSentenceTransformerProvider(model_name)
+        return LocalSentenceTransformerProvider(model_name, settings=settings)
     raise ValueError(f"Unsupported dense model: {model_name}")

@@ -4,6 +4,8 @@ import asyncio
 import math
 import threading
 
+from .config import Settings
+from .embeddings import _MODEL_INFERENCE_LOCK, configure_torch_resources
 from .search import SearchResult
 from .state import run_blocking
 
@@ -19,7 +21,10 @@ class RerankError(RuntimeError):
 class LocalReranker:
     model_name = "dragonkue/bge-reranker-v2-m3-ko"
 
-    def __init__(self):
+    def __init__(self, *, settings: Settings | None = None):
+        self.batch_size = settings.reranker_batch_size if settings else 8
+        self.cpu_threads = settings.cpu_threads if settings else 4
+        self.cuda_memory_fraction = settings.cuda_memory_fraction if settings else None
         self._model = None
         self._lock = asyncio.Lock()
         self._model_lock = threading.Lock()
@@ -51,6 +56,7 @@ class LocalReranker:
                     raise RerankError(self._initialization_error) from None
 
     def _initialize(self) -> None:
+        configure_torch_resources(self.cpu_threads, self.cuda_memory_fraction)
         import torch
         from sentence_transformers import CrossEncoder
 
@@ -95,5 +101,6 @@ class LocalReranker:
             return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
 
     def _score(self, query: str, candidates: list[SearchResult]):
-        self.warmup()
-        return self._model.predict([(query, candidate.document) for candidate in candidates])
+        with _MODEL_INFERENCE_LOCK:
+            self.warmup()
+            return self._model.predict([(query, candidate.document) for candidate in candidates], batch_size=self.batch_size)

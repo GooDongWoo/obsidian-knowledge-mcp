@@ -72,7 +72,7 @@ async def test_reranker_loads_on_first_use_and_replaces_rrf_scores(monkeypatch):
         def __init__(self, name, *, device):
             calls.append((name, device))
 
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             assert pairs == [("q", "a"), ("q", "b")]
             return [0.2, 0.8]
 
@@ -96,7 +96,7 @@ async def test_reranker_inference_failure_is_not_hidden(monkeypatch):
         def __init__(self, name, *, device):
             pass
 
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             raise RuntimeError("inference failed")
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
@@ -113,7 +113,7 @@ async def test_reranker_rejects_non_finite_scores(monkeypatch):
         def __init__(self, name, *, device):
             pass
 
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             return [float("nan")]
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
@@ -165,7 +165,7 @@ async def test_device_selection_and_cpu_fallback_still_apply(monkeypatch, availa
             attempts.append(device)
             if device == "cuda" and cuda_fails:
                 raise RuntimeError("private constructor details")
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             return [.2, .8]
 
     monkeypatch.setattr("torch.cuda.is_available", lambda: available)
@@ -197,7 +197,7 @@ async def test_failed_reranker_returns_unchanged_rrf_candidates(monkeypatch, fai
             attempts.append(device)
             if failure == "init":
                 raise RuntimeError("private init payload")
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             if failure == "inference":
                 raise RuntimeError("private inference payload")
             return {"nan": [float("nan"), .1], "inf": [.1, float("inf")], "short": [.1], "text": ["invalid", .1]}[failure]
@@ -223,3 +223,28 @@ async def test_empty_candidates_do_not_apply_or_load_reranker():
     store = MultiModelStore({"dragonkue/BGE-m3-ko": CandidateStore([])})
     assert await store.hybrid_search(SearchRequest(query="q")) == []
     assert store.reranker.status["loaded"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("batch,expected", [(None, 8), (3, 3)])
+async def test_reranker_batch_reaches_predict(tmp_path, monkeypatch, batch, expected):
+    from dataclasses import replace
+    from knowledge_mcp.config import Settings
+    from knowledge_mcp.reranker import LocalReranker
+    calls = []
+    class CrossEncoder:
+        def __init__(self, name, *, device):
+            pass
+        def predict(self, pairs, *, batch_size):
+            calls.append(batch_size)
+            return [.2, .8]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    settings = Settings.from_paths(vault_root=tmp_path / "vault", project_root=tmp_path / "project")
+    if batch is not None:
+        settings = replace(settings, reranker_batch_size=batch)
+    reranker = LocalReranker(settings=settings)
+    assert not reranker.loaded
+    ranked = await reranker.rerank("synthetic", [result("a", "one", .9), result("b", "two", .1)])
+    assert [item.point_id for item in ranked] == ["b", "a"]
+    assert calls == [expected]

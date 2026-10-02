@@ -30,7 +30,7 @@ async def test_warmup_and_rerank_construct_one_cross_encoder(monkeypatch):
             entered.set()
             assert release.wait(5)
 
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             return [.5] * len(pairs)
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
@@ -60,7 +60,7 @@ async def test_cancelled_rerank_drains_predict_before_next_request(monkeypatch):
         def __init__(self, name, *, device):
             pass
 
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size=8):
             predictions.append(pairs)
             if len(predictions) == 1:
                 entered.set()
@@ -99,7 +99,7 @@ async def test_first_embedding_model_construction_stays_off_event_loop(monkeypat
         def encode(self, documents, **kwargs):
             return np.zeros((len(documents), 1024))
 
-    monkeypatch.setattr("knowledge_mcp.embeddings._limit_cpu_threads", lambda: None)
+    monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))
     provider = LocalSentenceTransformerProvider("test-model")
     vectors = await getattr(provider, method)(argument)
@@ -120,7 +120,7 @@ async def test_embedding_warmup_and_first_query_construct_one_model(monkeypatch)
         def encode(self, documents, **kwargs):
             return np.zeros((len(documents), 1024))
 
-    monkeypatch.setattr("knowledge_mcp.embeddings._limit_cpu_threads", lambda: None)
+    monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))
     provider = LocalSentenceTransformerProvider("test-model")
     warmup = asyncio.create_task(asyncio.to_thread(provider.warmup))
@@ -155,7 +155,7 @@ def blocked_provider(monkeypatch, request):
             finished.set()
             return np.zeros((len(documents), 1024))
 
-    monkeypatch.setattr("knowledge_mcp.embeddings._limit_cpu_threads", lambda: None)
+    monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))
     if request.param == "sentence":
         provider = LocalSentenceTransformerProvider("test-model")
@@ -170,7 +170,7 @@ def blocked_provider(monkeypatch, request):
             def passage_embed(self, documents, **kwargs):
                 yield from self.encode(documents)
 
-            def query_embed(self, documents):
+            def query_embed(self, documents, **kwargs):
                 yield from self.encode(documents)
 
         monkeypatch.setattr("knowledge_mcp.embeddings.select_device", lambda: Device.CPU)

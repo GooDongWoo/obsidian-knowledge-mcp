@@ -50,19 +50,20 @@ def _dependencies(settings: Settings):
     from .indexer import KnowledgeIndexer
     from .qdrant_store import KnowledgeStore
     from .retrieval import MultiModelStore
+    from .reranker import LocalReranker
 
     log = OperationLog(settings.runtime_dir)
     stores = {}
     indexers = {}
     for model, selected in model_settings(settings).items():
-        provider = create_embedding_provider(model)
+        provider = create_embedding_provider(model, settings=selected)
         store = KnowledgeStore(selected, provider)
         stores[model] = store
         indexers[model] = KnowledgeIndexer(
             selected, store, provider.get_tokenizer(),
             manifest=Manifest(settings.runtime_dir, selected.collection_name), operation_log=log,
         )
-    return MultiModelStore(stores), log, indexers
+    return MultiModelStore(stores, LocalReranker(settings=settings)), log, indexers
 
 
 def ensure_qdrant(settings: Settings, *, timeout_seconds: int = 60) -> None:

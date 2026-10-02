@@ -54,12 +54,35 @@ class Settings:
     dense_model: str
     client_name: str
     project_root: Path | None = None
+    embedding_batch_size: int = 8
+    reranker_batch_size: int = 8
+    cpu_threads: int = 4
+    cuda_memory_fraction: float | None = None
+    onnx_gpu_mem_limit: int | None = None
+    onnx_arena_extend_strategy: str = "kSameAsRequested"
+    onnx_intra_op_num_threads: int = 4
 
     def __post_init__(self) -> None:
         if self.project_root is None:
             object.__setattr__(self, "project_root", self.vault_root / "00_System" / "knowledge-mcp")
         if self.project_root.resolve() == self.vault_root.resolve():
             raise ValueError("project_root must be outside the Vault root")
+        for name in ("embedding_batch_size", "reranker_batch_size", "cpu_threads", "onnx_intra_op_num_threads"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            if "batch_size" in name and value > 256:
+                raise ValueError(f"{name} must be between 1 and 256")
+        if self.cuda_memory_fraction is not None:
+            if (isinstance(self.cuda_memory_fraction, bool)
+                    or not isinstance(self.cuda_memory_fraction, (int, float))
+                    or not 0 < self.cuda_memory_fraction <= 1):
+                raise ValueError("cuda_memory_fraction must be greater than 0 and at most 1")
+        if self.onnx_gpu_mem_limit is not None:
+            if type(self.onnx_gpu_mem_limit) is not int or self.onnx_gpu_mem_limit < 1:
+                raise ValueError("onnx_gpu_mem_limit must be positive bytes")
+        if self.onnx_arena_extend_strategy not in ("kNextPowerOfTwo", "kSameAsRequested"):
+            raise ValueError("onnx_arena_extend_strategy must be kNextPowerOfTwo or kSameAsRequested")
 
     @property
     def project_dir(self) -> Path:
@@ -108,4 +131,13 @@ class Settings:
             dense_model=dense_model,
             client_name=client_name,
             project_root=project_root,
+            embedding_batch_size=int(os.environ.get("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "8")),
+            reranker_batch_size=int(os.environ.get("KNOWLEDGE_RERANKER_BATCH_SIZE", "8")),
+            cpu_threads=int(os.environ.get("KNOWLEDGE_CPU_THREADS", "4")),
+            cuda_memory_fraction=float(os.environ["KNOWLEDGE_CUDA_MEMORY_FRACTION"])
+                if os.environ.get("KNOWLEDGE_CUDA_MEMORY_FRACTION") else None,
+            onnx_gpu_mem_limit=int(os.environ["KNOWLEDGE_ONNX_GPU_MEM_LIMIT"])
+                if os.environ.get("KNOWLEDGE_ONNX_GPU_MEM_LIMIT") else None,
+            onnx_arena_extend_strategy=os.environ.get("KNOWLEDGE_ONNX_ARENA_EXTEND_STRATEGY", "kSameAsRequested"),
+            onnx_intra_op_num_threads=int(os.environ.get("KNOWLEDGE_ONNX_INTRA_OP_NUM_THREADS", "4")),
         )

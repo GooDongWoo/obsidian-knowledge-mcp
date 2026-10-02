@@ -62,13 +62,17 @@ async def test_indexer_handles_skipped_large_file(settings, monkeypatch):
         async def ensure_schema(self):
             pass
 
+        async def collection_inventory(self):
+            from knowledge_mcp.qdrant_store import CollectionInventory
+            return CollectionInventory()
+
         async def generation_matches(self, *args):
             return False
 
         async def replace_generation(self, *args, **kwargs):
             return []
 
-        async def cleanup_orphans(self, *args):
+        async def cleanup_orphans(self, *args, **kwargs):
             pass
 
     class FakeTokenizer:
@@ -142,3 +146,175 @@ def test_torch_thread_limit_called():
         assert mock_set_threads.called
         args, _ = mock_set_threads.call_args
         assert args[0] <= 4
+
+
+def test_resource_settings_preserve_positional_calls_and_parse_env(tmp_path, monkeypatch):
+    from dataclasses import replace
+    monkeypatch.setattr("knowledge_mcp.config._load_env_file", lambda *_: None)
+    monkeypatch.setenv("KNOWLEDGE_VAULT_ROOT", str(tmp_path / "vault"))
+    monkeypatch.setenv("KNOWLEDGE_PROJECT_ROOT", str(tmp_path / "project"))
+    values = {
+        "KNOWLEDGE_EMBEDDING_BATCH_SIZE": "12", "KNOWLEDGE_RERANKER_BATCH_SIZE": "6",
+        "KNOWLEDGE_CPU_THREADS": "2", "KNOWLEDGE_CUDA_MEMORY_FRACTION": "0.24",
+        "KNOWLEDGE_ONNX_GPU_MEM_LIMIT": "268435456",
+        "KNOWLEDGE_ONNX_ARENA_EXTEND_STRATEGY": "kSameAsRequested",
+        "KNOWLEDGE_ONNX_INTRA_OP_NUM_THREADS": "3",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    configured = Settings.from_env("test")
+    assert (configured.embedding_batch_size, configured.reranker_batch_size, configured.cpu_threads) == (12, 6, 2)
+    assert configured.cuda_memory_fraction == .24
+    assert (configured.onnx_gpu_mem_limit, configured.onnx_arena_extend_strategy, configured.onnx_intra_op_num_threads) == (268435456, "kSameAsRequested", 3)
+    positional = Settings(tmp_path / "vault", tmp_path / "runtime", Settings.DEFAULT_QDRANT_URL,
+                          "test", Settings.DEFAULT_DENSE_MODEL, "test", tmp_path / "project")
+    assert positional.project_root == tmp_path / "project"
+    assert replace(positional, embedding_batch_size=1).embedding_batch_size == 1
+
+
+@pytest.mark.parametrize("name,value", [
+    ("embedding_batch_size", 0), ("embedding_batch_size", 257),
+    ("reranker_batch_size", -1), ("cpu_threads", 0),
+    ("onnx_intra_op_num_threads", 0), ("onnx_gpu_mem_limit", 0),
+    ("onnx_arena_extend_strategy", "invalid"), ("cuda_memory_fraction", 0),
+    ("cuda_memory_fraction", 1.01), ("cuda_memory_fraction", float("nan")),
+    ("embedding_batch_size", True), ("cpu_threads", 1.5),
+])
+def test_resource_settings_reject_invalid_values(settings, name, value):
+    from dataclasses import replace
+    with pytest.raises(ValueError, match=name):
+        replace(settings, **{name: value})
+
+
+def test_resource_settings_do_not_change_index_generation(settings):
+    from dataclasses import replace
+    source = settings.vault_root / "synthetic.md"
+    source.write_text("synthetic input", encoding="utf-8")
+    original = KnowledgeIndexer(settings, object(), object())
+    tuned = KnowledgeIndexer(replace(settings, embedding_batch_size=4, cpu_threads=2,
+                                    cuda_memory_fraction=.24), object(), object())
+    assert original._fingerprint(source) == tuned._fingerprint(source)
+
+
+def test_torch_resources_clamp_threads_and_set_cuda_budget_once(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from concurrent.futures import ThreadPoolExecutor
+    from knowledge_mcp import embeddings
+    calls = []
+    thread_count = [8]
+    def set_threads(count):
+        calls.append(("threads", count))
+        thread_count[0] = count
+    fake_torch = SimpleNamespace(
+        get_num_threads=lambda: thread_count[0], set_num_threads=set_threads,
+        cuda=SimpleNamespace(is_available=lambda: True,
+                             set_per_process_memory_fraction=lambda fraction: calls.append(("fraction", fraction))),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(embeddings.os, "cpu_count", lambda: 2)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(embeddings.configure_torch_resources, 4, .24) for _ in range(2)]
+        for future in futures:
+            future.result()
+    assert calls.count(("threads", 2)) == 1
+    assert calls.count(("fraction", .24)) == 1
+
+
+def test_onnx_runtime_preparation_preserves_torch_resource_settings(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from knowledge_mcp import embeddings
+    thread_count = [8]
+    monkeypatch.setattr(embeddings.os, "cpu_count", lambda: 8)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        get_num_threads=lambda: thread_count[0], set_num_threads=lambda count: thread_count.__setitem__(0, count)))
+    monkeypatch.setattr(embeddings.ort, "preload_dlls", lambda: None)
+    embeddings.configure_torch_resources(2)
+    embeddings.prepare_cuda_runtime()
+    assert thread_count == [2]
+
+
+def test_cpu_only_resources_do_not_touch_cuda_allocator(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from knowledge_mcp import embeddings
+    def forbidden(*_):
+        pytest.fail("CPU inference touched CUDA allocator")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        set_num_threads=lambda *_: None, get_num_threads=lambda: 4,
+        cuda=SimpleNamespace(is_available=lambda: False, set_per_process_memory_fraction=forbidden)))
+    embeddings.configure_torch_resources(4, .24)
+
+
+def test_model_inference_is_serialized_across_embedding_and_reranker(monkeypatch):
+    import threading
+    import sys
+    from types import SimpleNamespace
+    from concurrent.futures import ThreadPoolExecutor
+    import numpy as np
+    from knowledge_mcp.embeddings import LocalSentenceTransformerProvider
+    from knowledge_mcp.reranker import LocalReranker
+    entered, release, attempted, predicted = (threading.Event() for _ in range(4))
+    provider = LocalSentenceTransformerProvider("dragonkue/BGE-m3-ko")
+    def encode(*_, **__):
+        entered.set()
+        assert release.wait(5)
+        return np.zeros((1, 1024))
+    provider._model = SimpleNamespace(encode=encode)
+    reranker = LocalReranker()
+    reranker._model = SimpleNamespace(predict=lambda *_, **__: predicted.set() or [.2])
+    def score():
+        attempted.set()
+        return reranker._score("synthetic", [SimpleNamespace(document="synthetic")])
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(provider._encode, ["synthetic"])
+        assert entered.wait(5)
+        second = executor.submit(score)
+        try:
+            assert attempted.wait(5)
+            assert not predicted.wait(.1), "reranking overlapped native embedding inference"
+        finally:
+            release.set()
+        first.result()
+        assert second.result() == [.2]
+    assert predicted.is_set()
+
+
+@pytest.mark.anyio
+async def test_cli_dependencies_apply_selected_resource_settings(settings, monkeypatch):
+    from dataclasses import replace
+    import sys
+    from types import SimpleNamespace
+    import numpy as np
+    from knowledge_mcp.cli import _dependencies
+    calls = []
+    class Model:
+        tokenizer = object()
+        def __init__(self, name):
+            pass
+        def encode(self, texts, *, batch_size, normalize_embeddings):
+            calls.append(("embedding", batch_size))
+            return np.zeros((len(texts), 1024))
+    class CrossEncoder:
+        def __init__(self, name, *, device):
+            pass
+        def predict(self, pairs, *, batch_size):
+            calls.append(("reranker", batch_size))
+            return [.2]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model, CrossEncoder=CrossEncoder))
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    configured = replace(settings, embedding_batch_size=3, reranker_batch_size=2)
+    stores, _, _ = _dependencies(configured)
+    assert not stores.reranker.loaded
+    store = stores.stores[settings.dense_model]
+    from knowledge_mcp.search import SearchResult
+    candidate = SearchResult(point_id="test", document="synthetic", source_path="synthetic.md",
+                             document_type="other", file_type="md", security_level="public",
+                             created_at="2025-01-01T00:00:00+09:00", modified_at="2025-01-01T00:00:00+09:00", score=.1)
+    try:
+        await store.embedding_provider.embed_documents(["synthetic"])
+        await stores.reranker.rerank("synthetic", [candidate])
+    finally:
+        await store.client.close()
+    assert calls == [("embedding", 3), ("reranker", 2)]
