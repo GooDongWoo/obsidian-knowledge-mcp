@@ -37,6 +37,19 @@ def test_manifest_detects_add_change_delete(tmp_path):
     assert manifest.diff({}).deleted == ["a.md"]
 
 
+def test_manifest_persists_optional_source_cache_and_migrates_old_schema(tmp_path):
+    with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        connection.execute("CREATE TABLE collection_files (collection_name TEXT, path TEXT, content_hash TEXT, generation TEXT, point_count INTEGER, point_ids TEXT, completed_at TEXT, PRIMARY KEY(collection_name, path))")
+        connection.execute("INSERT INTO collection_files VALUES ('test', 'old.md', 'hash', 'gen', 0, '[]', 'now')")
+    manifest = Manifest(tmp_path, "test")
+    old = manifest.completed_files()["old.md"]
+    assert old.mtime_ns is None and old.size is None
+    manifest.mark_complete("old.md", "hash", "gen", 0, mtime_ns=123, size=42,
+                           metadata_signature="meta", indexing_version="config")
+    entry = Manifest(tmp_path, "test").completed_files()["old.md"]
+    assert (entry.mtime_ns, entry.size, entry.metadata_signature, entry.indexing_version) == (123, 42, "meta", "config")
+
+
 def test_manifest_persists_point_ids_without_document_body(tmp_path):
     manifest = Manifest(tmp_path)
 

@@ -1,7 +1,7 @@
 """Local Qdrant schema, safe generation writes, and filtered hybrid retrieval."""
 
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 import json
 from typing import Mapping, Sequence
 from uuid import NAMESPACE_URL, uuid5
@@ -25,6 +25,26 @@ PAYLOAD_INDEXES = {
     "security_level": models.PayloadSchemaType.KEYWORD,
     "generation": models.PayloadSchemaType.KEYWORD,
 }
+
+
+@dataclass
+class CollectionInventory:
+    """One paged snapshot, maintained after successful writes by the locked writer."""
+
+    generations: dict[tuple[str | None, str | None], set[str | int]] = field(default_factory=dict)
+
+    def matches(self, source_path: str, generation: str, point_count: int, point_ids: Sequence[str] = ()) -> bool:
+        actual = self.generations.get((source_path, generation), set())
+        return len(actual) == point_count and (not point_ids or {str(point_id) for point_id in actual} == set(point_ids))
+
+    def remove(self, source_path: str) -> None:
+        for key in list(self.generations):
+            if key[0] == source_path:
+                del self.generations[key]
+
+    def replace(self, source_path: str, generation: str, point_ids: Sequence[str]) -> None:
+        self.remove(source_path)
+        self.generations[source_path, generation] = set(point_ids)
 
 
 class KnowledgeStore:
@@ -112,7 +132,8 @@ class KnowledgeStore:
         for i in range(0, len(points), BATCH_SIZE):
             await self.client.upsert(self.settings.collection_name, points[i:i + BATCH_SIZE], wait=True)
         await self.client.delete(self.settings.collection_name, models.FilterSelector(filter=models.Filter(
-            must=[_match("source_path", source_path)], must_not=[_match("generation", generation)],
+            must=[_match("source_path", source_path)],
+            must_not=[models.HasIdCondition(has_id=[point.id for point in points])],
         )), wait=True)
         return [str(point.id) for point in points]
 
@@ -142,24 +163,37 @@ class KnowledgeStore:
         )
         return {str(point.id) for point in points} == set(point_ids)
 
-    async def cleanup_orphans(self, completed_generations: Mapping[str, str]) -> None:
-        """Remove points absent from the completed manifest while holding index_lock."""
+    async def collection_inventory(self) -> CollectionInventory:
+        """Read only IDs and generation metadata once per page, without vectors/bodies."""
+        inventory = CollectionInventory()
         offset = None
         while True:
             points, offset = await self.client.scroll(
                 self.settings.collection_name, offset=offset, limit=256,
                 with_payload=["metadata.source_path", "metadata.generation"], with_vectors=False,
             )
-            orphans = []
             for point in points:
                 metadata = (point.payload or {}).get("metadata", {})
                 path = metadata.get("source_path")
-                if path not in completed_generations or metadata.get("generation") != completed_generations[path]:
-                    orphans.append(point.id)
-            if orphans:
-                await self.client.delete(self.settings.collection_name, models.PointIdsList(points=orphans), wait=True)
+                generation = metadata.get("generation")
+                key = (path if isinstance(path, str) else None, generation if isinstance(generation, str) else None)
+                inventory.generations.setdefault(key, set()).add(point.id)
             if offset is None:
                 break
+        return inventory
+
+    async def cleanup_orphans(
+        self, completed_generations: Mapping[str, str], *, inventory: CollectionInventory | None = None,
+    ) -> None:
+        """Remove uncommitted points; the locked writer may reuse its updated snapshot."""
+        if inventory is None:
+            inventory = await self.collection_inventory()
+        orphans = [point_id for (path, generation), point_ids in inventory.generations.items()
+                   if path not in completed_generations or generation != completed_generations[path]
+                   for point_id in point_ids]
+        for start in range(0, len(orphans), 256):
+            await self.client.delete(self.settings.collection_name,
+                                     models.PointIdsList(points=orphans[start:start + 256]), wait=True)
 
     async def hybrid_candidates(self, request: SearchRequest) -> list[SearchResult]:
         """Return up to 40 filtered RRF candidates before source limits or reranking."""

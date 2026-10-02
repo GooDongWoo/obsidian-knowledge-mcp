@@ -110,7 +110,11 @@ async def test_sync_accepts_outer_index_lock(tmp_path, monkeypatch):
         async def ensure_schema(self):
             pass
 
-        async def cleanup_orphans(self, _committed):
+        async def collection_inventory(self):
+            from knowledge_mcp.qdrant_store import CollectionInventory
+            return CollectionInventory()
+
+        async def cleanup_orphans(self, _committed, **kwargs):
             pass
 
     root = tmp_path / "vault"
@@ -413,3 +417,140 @@ async def test_source_change_during_parse_is_retried_without_overwriting_old_gen
     result = await indexer.sync()
     assert result.failed == 1
     assert await points(indexer) == before
+
+
+@pytest.mark.anyio
+async def test_unchanged_sync_reads_no_source_bodies_and_only_inventory_pages(indexer, monkeypatch):
+    from pathlib import Path
+
+    for number in range(4):
+        (indexer.settings.vault_root / f"extra-{number}.md").write_text("Another source", encoding="utf-8")
+    assert (await indexer.sync()).added == 5
+    reads, requests = [], {"count": 0, "scroll": 0}
+    original_read = Path.read_bytes
+    original_scroll = indexer.store.client.scroll
+    original_count = indexer.store.client.count
+
+    def read(path):
+        if path.suffix == ".md":
+            reads.append(path)
+        return original_read(path)
+
+    async def scroll(*args, **kwargs):
+        requests["scroll"] += 1
+        # Force multiple actual server pages without building 257 sources.
+        kwargs["limit"] = 2
+        return await original_scroll(*args, **kwargs)
+
+    async def count(*args, **kwargs):
+        requests["count"] += 1
+        return await original_count(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(indexer.store.client, "scroll", scroll)
+    monkeypatch.setattr(indexer.store.client, "count", count)
+    result = await indexer.sync()
+    assert result.unchanged == 5 and result.failed == 0
+    assert reads == []
+    assert requests == {"count": 0, "scroll": 3}
+
+
+@pytest.mark.anyio
+async def test_force_full_hash_detects_same_stat_content_change(indexer):
+    import os
+
+    await indexer.sync()
+    source = indexer.settings.vault_root / "sample.md"
+    before = source.stat()
+    source.write_bytes(source.read_bytes().replace(b"Original", b"Modified"))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert (await indexer.sync()).unchanged == 1
+    result = await indexer.sync(force_full_hash=True)
+    assert result.changed == 1 and result.failed == 0
+    assert "Modified" in (await points(indexer))[0].payload["document"]
+
+
+@pytest.mark.anyio
+async def test_legacy_manifest_hashes_once_then_caches_stat(indexer, monkeypatch):
+    import sqlite3
+
+    await indexer.sync()
+    with sqlite3.connect(indexer.settings.runtime_dir / "state.sqlite3") as connection:
+        connection.execute("UPDATE collection_files SET mtime_ns = NULL, size = NULL")
+    calls = []
+    fingerprint = indexer._fingerprint
+
+    def measured(path):
+        calls.append(path)
+        return fingerprint(path)
+
+    monkeypatch.setattr(indexer, "_fingerprint", measured)
+    assert (await indexer.sync()).unchanged == 1
+    assert len(calls) == 1
+    assert (await indexer.sync()).unchanged == 1
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("corruption", ["missing", "extra", "missing_and_extra"])
+async def test_same_generation_missing_and_extra_ids_are_repaired(indexer, corruption):
+    from qdrant_client import models
+
+    await indexer.sync()
+    record = (await points(indexer))[0]
+    vectors = (await indexer.store.client.retrieve(indexer.settings.collection_name, [record.id], with_vectors=True))[0].vector
+    extra_id = str(uuid4())
+    if "extra" in corruption:
+        await indexer.store.client.upsert(indexer.settings.collection_name, [
+            models.PointStruct(id=extra_id, payload=record.payload, vector=vectors),
+        ], wait=True)
+    if "missing" in corruption:
+        await indexer.store.client.delete(indexer.settings.collection_name, models.PointIdsList(points=[record.id]), wait=True)
+    result = await indexer.sync()
+    assert result.changed == 1 and result.failed == 0
+    assert {point.id for point in await points(indexer)} == {record.id}
+    assert (await indexer.sync()).unchanged == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change_after_hash", [1, 2])
+async def test_stat_change_after_fingerprint_cannot_commit_stale_cache(indexer, monkeypatch, change_after_hash):
+    import os
+
+    await indexer.sync()
+    before = await points(indexer)
+    source = indexer.settings.vault_root / "sample.md"
+    source.write_text("Updated source body", encoding="utf-8")
+    fingerprint = indexer._fingerprint
+    calls = 0
+
+    def changing_fingerprint(path):
+        nonlocal calls
+        calls += 1
+        result = fingerprint(path)
+        if calls == change_after_hash:
+            stat = path.stat()
+            path.write_text("Another source body", encoding="utf-8")
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        return result
+
+    monkeypatch.setattr(indexer, "_fingerprint", changing_fingerprint)
+    result = await indexer.sync()
+    assert result.error_codes == ["source_changed_during_parse"]
+    assert await points(indexer) == before
+    monkeypatch.setattr(indexer, "_fingerprint", fingerprint)
+    assert (await indexer.sync()).changed == 1
+
+
+@pytest.mark.anyio
+async def test_parser_version_change_invalidates_stat_cache(indexer, monkeypatch):
+    import knowledge_mcp.indexer as module
+
+    await indexer.sync()
+    before = indexer.manifest.completed_files()["sample.md"]
+    monkeypatch.setattr(module, "PARSER_CHUNKER_SCHEMA", "documents-v2:400:60")
+    result = await indexer.sync()
+    after = indexer.manifest.completed_files()["sample.md"]
+    assert result.changed == 1 and result.failed == 0
+    assert after.content_hash == before.content_hash
+    assert after.indexing_version != before.indexing_version

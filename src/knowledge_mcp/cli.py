@@ -119,6 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     for command in ("index", "rebuild"):
         sub = subparsers.add_parser(command)
         sub.add_argument("--client", choices=("codex", "claude-code", "antigravity"), default="codex")
+        sub.add_argument("--force-full-hash", action="store_true", help="Read and hash every source even when file stats match")
 
     return parser
 
@@ -194,11 +195,12 @@ def main(argv: list[str] | None = None) -> int:
                     for indexer in indexers.values():
                         indexer.manifest.clear()
                     summaries = {
-                        model: await indexer.sync(assume_locked=True)
+                        model: await indexer.sync(assume_locked=True, force_full_hash=args.force_full_hash)
                         for model, indexer in indexers.items()
                     }
             else:
-                summaries = {model: await indexer.sync() for model, indexer in indexers.items()}
+                summaries = {model: await indexer.sync(force_full_hash=args.force_full_hash)
+                             for model, indexer in indexers.items()}
             for model, summary in summaries.items():
                 print(f"{model}: {asdict(summary)}", file=sys.stderr)
             return all(summary.status == "completed" for summary in summaries.values())

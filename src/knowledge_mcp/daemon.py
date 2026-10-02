@@ -355,7 +355,7 @@ class _DaemonRuntime:
         finally:
             self.dependencies_ready.set()
 
-    async def sync(self, *, rebuild: bool = False) -> dict[str, Any]:
+    async def sync(self, *, rebuild: bool = False, force_full_hash: bool = False) -> dict[str, Any]:
         from fastmcp.exceptions import ToolError
 
         task = asyncio.current_task()
@@ -374,7 +374,7 @@ class _DaemonRuntime:
                                     await selected.client.delete_collection(selected.settings.collection_name)
                             for indexer in self.application.indexers.values():
                                 await run_blocking(indexer.manifest.clear)
-                        summaries = {model: await indexer.sync(assume_locked=True)
+                        summaries = {model: await indexer.sync(assume_locked=True, force_full_hash=force_full_hash)
                                      for model, indexer in self.application.indexers.items()}
                     result = {model: asdict(summary) for model, summary in summaries.items()}
                     self.application.index_snapshot = await self.application.read_index_status()
@@ -438,8 +438,8 @@ def create_daemon_application(settings: Settings, *, sync_tool: bool = True):
 
     if sync_tool:
         @application.mcp.tool(name="knowledge-index-sync", description="Trigger synchronization of the local Vault index.")
-        async def knowledge_index_sync(rebuild: bool = False) -> dict[str, Any]:
-            return await runtime.sync(rebuild=rebuild)
+        async def knowledge_index_sync(rebuild: bool = False, force_full_hash: bool = False) -> dict[str, Any]:
+            return await runtime.sync(rebuild=rebuild, force_full_hash=force_full_hash)
 
     @application.mcp.custom_route("/health", methods=["GET"])
     async def health(request):

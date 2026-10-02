@@ -336,11 +336,13 @@ async def test_initial_and_manual_sync_share_writer_queue_and_keep_model_status(
     release = asyncio.Event()
     calls = 0
     active = 0
+    hash_options = []
 
     class Indexer:
         async def sync(self, **kwargs):
             nonlocal calls, active
             calls += 1
+            hash_options.append(kwargs.get("force_full_hash", False))
             active += 1
             assert active == 1
             try:
@@ -367,13 +369,14 @@ async def test_initial_and_manual_sync_share_writer_queue_and_keep_model_status(
     application = daemon.create_daemon_application(settings)
     async with Client(application.mcp) as client:
         await asyncio.wait_for(initial.wait(), 2)
-        first = asyncio.create_task(client.call_tool("knowledge-index-sync", {}))
+        first = asyncio.create_task(client.call_tool("knowledge-index-sync", {"force_full_hash": True}))
         second = asyncio.create_task(client.call_tool("knowledge-index-sync", {}))
         await asyncio.sleep(.05)
         assert calls == 1
         release.set()
         await asyncio.wait_for(asyncio.gather(first, second), 3)
         assert calls == 3
+        assert sorted(hash_options) == [False, False, True]
         status = (await client.call_tool("knowledge-index-status", {})).data
         assert status["state"] == "ready"
         assert status["models"]["test"]["point_count"] == 7

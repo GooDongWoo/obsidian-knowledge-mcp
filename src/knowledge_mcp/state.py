@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence, Sized
 import warnings
 
 
@@ -36,6 +36,10 @@ class ManifestEntry:
     generation: str
     point_count: int
     point_ids: tuple[str, ...] = ()
+    mtime_ns: int | None = None
+    size: int | None = None
+    metadata_signature: str | None = None
+    indexing_version: str | None = None
 
 
 class Manifest:
@@ -73,20 +77,28 @@ class Manifest:
         generation: str,
         point_count: int,
         point_ids: Sequence[str] = (),
+        *, mtime_ns: int | None = None, size: int | None = None,
+        metadata_signature: str | None = None, indexing_version: str | None = None,
     ) -> None:
         with _connection(self.runtime_dir) as connection:
             connection.execute(
                 """
-                INSERT INTO collection_files(collection_name, path, content_hash, generation, point_count, point_ids, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO collection_files(collection_name, path, content_hash, generation, point_count, point_ids, completed_at,
+                                             mtime_ns, size, metadata_signature, indexing_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(collection_name, path) DO UPDATE SET
                     content_hash = excluded.content_hash,
                     generation = excluded.generation,
                     point_count = excluded.point_count,
                     point_ids = excluded.point_ids,
-                    completed_at = excluded.completed_at
+                    completed_at = excluded.completed_at,
+                    mtime_ns = excluded.mtime_ns,
+                    size = excluded.size,
+                    metadata_signature = excluded.metadata_signature,
+                    indexing_version = excluded.indexing_version
                 """,
-                (self.collection_name, path, content_hash, generation, point_count, json.dumps(list(point_ids)), _now()),
+                (self.collection_name, path, content_hash, generation, point_count, json.dumps(list(point_ids)), _now(),
+                 mtime_ns, size, metadata_signature, indexing_version),
             )
 
     def remove(self, path: str) -> None:
@@ -113,9 +125,10 @@ class Manifest:
                 row["path"]: ManifestEntry(
                     row["content_hash"], row["generation"], row["point_count"],
                     tuple(json.loads(row["point_ids"] or "[]")),
+                    row["mtime_ns"], row["size"], row["metadata_signature"], row["indexing_version"],
                 )
                 for row in connection.execute(
-                    "SELECT path, content_hash, generation, point_count, point_ids "
+                    "SELECT path, content_hash, generation, point_count, point_ids, mtime_ns, size, metadata_signature, indexing_version "
                     "FROM collection_files WHERE collection_name = ?",
                     (self.collection_name,),
                 )
@@ -162,7 +175,7 @@ class OperationLog:
         *,
         query: str | None = None,
         filters: Mapping[str, object] | None = None,
-        results: Sequence[Mapping[str, object]] = (),
+        results: Sized = (),
         client_name: str | None = None,
         elapsed_ms: float | None = None,
         rerank_requested: bool | None = None,
@@ -388,6 +401,9 @@ def _initialize_locked(runtime_dir: Path) -> None:
             connection.execute("DROP TABLE legacy_queries")
         _add_column_if_missing(connection, "index_runs", "error_code", "TEXT")
         _add_column_if_missing(connection, "index_runs", "collection_name", "TEXT")
+        for column, definition in (("mtime_ns", "INTEGER"), ("size", "INTEGER"),
+                                   ("metadata_signature", "TEXT"), ("indexing_version", "TEXT")):
+            _add_column_if_missing(connection, "collection_files", column, definition)
         if "error" in _columns(connection, "index_runs"):
             connection.execute("UPDATE index_runs SET error = NULL WHERE error IS NOT NULL")
         if scrub:

@@ -11,6 +11,26 @@ def test_cli_accepts_full_rebuild():
     assert _parser().parse_args(["rebuild", "--client", "codex"]).command == "rebuild"
 
 
+def test_cli_force_full_hash_reaches_indexer(tmp_path, monkeypatch):
+    from knowledge_mcp import cli
+    from knowledge_mcp.config import Settings
+    from knowledge_mcp.indexer import IndexRunSummary
+
+    settings = Settings.from_paths(vault_root=tmp_path / "vault", project_root=tmp_path / "project")
+    calls = []
+
+    class Indexer:
+        async def sync(self, **kwargs):
+            calls.append(kwargs)
+            return IndexRunSummary()
+
+    monkeypatch.setattr(cli.Settings, "from_env", lambda _: settings)
+    monkeypatch.setattr(cli, "ensure_qdrant", lambda _: None)
+    monkeypatch.setattr(cli, "_dependencies", lambda _: (None, None, {"test": Indexer()}))
+    assert cli.main(["index", "--force-full-hash"]) == 0
+    assert calls == [{"force_full_hash": True}]
+
+
 def test_model_collections_returns_single_bge_model(tmp_path):
     from knowledge_mcp.cli import model_settings
     from knowledge_mcp.config import Settings
@@ -57,8 +77,9 @@ def test_rebuild_removes_collection_before_reindexing(tmp_path, monkeypatch):
             self.name = name
             self.manifest = SimpleNamespace(clear=lambda: calls.append(f"clear:{name}"))
 
-        async def sync(self, *, assume_locked=False):
+        async def sync(self, *, assume_locked=False, force_full_hash=False):
             assert assume_locked
+            assert not force_full_hash
             calls.append(f"sync:{self.name}")
             return IndexRunSummary(added=1)
 
@@ -81,30 +102,55 @@ def test_rebuild_removes_collection_before_reindexing(tmp_path, monkeypatch):
 
 
 def test_serve_starts_with_partial_file_failures(tmp_path, monkeypatch):
+    import asyncio
+    from fastmcp import Client
     from knowledge_mcp import cli
     from knowledge_mcp.indexer import IndexRunSummary
     from knowledge_mcp.config import Settings
+    from knowledge_mcp.state import OperationLog
+    from test_server import FakeStore
 
     settings = Settings.from_paths(vault_root=tmp_path / "vault", project_root=tmp_path / "project")
     calls = []
 
     class Indexer:
-        async def sync(self):
+        async def sync(self, **kwargs):
+            calls.append("sync")
             return IndexRunSummary(failed=1, error_codes=["parse_failed"])
 
     monkeypatch.setattr(cli.Settings, "from_env", lambda _: settings)
     monkeypatch.setattr(cli, "ensure_qdrant", lambda _: None)
-    monkeypatch.setattr(cli, "_dependencies", lambda _: (None, None, {"bge": Indexer()}))
-    async def run_async(**kwargs):
-        calls.append(kwargs)
+    monkeypatch.setattr(cli, "_dependencies", lambda _: (
+        FakeStore(), OperationLog(settings.runtime_dir), {"bge": Indexer()},
+    ))
+    create = cli.create_daemon_application
 
-    monkeypatch.setattr(
-        cli, "create_application",
-        lambda *_: SimpleNamespace(mcp=SimpleNamespace(run_async=run_async)),
-    )
+    def application(selected, *, sync_tool):
+        assert not sync_tool
+        app = create(selected, sync_tool=sync_tool)
+
+        async def exercise_lifespan():
+            async with Client(app.mcp) as client:
+                async with asyncio.timeout(2):
+                    while app.runtime_status["state"] in {"starting", "indexing"}:
+                        await asyncio.sleep(.01)
+                status = (await client.call_tool("knowledge-index-status", {})).data
+                assert status["state"] == "error"
+                assert status["last_error"] == "parse_failed"
+                assert status["last_index"]["bge"]["failed"] == 1
+                assert {tool.name for tool in await client.list_tools()} == {"qdrant-find", "knowledge-index-status"}
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            asyncio.run(exercise_lifespan())
+
+        monkeypatch.setattr(app.mcp, "run", run)
+        return app
+
+    monkeypatch.setattr(cli, "create_daemon_application", application)
 
     assert cli.main(["serve", "--standalone"]) == 0
-    assert calls == [{"transport": "stdio"}]
+    assert calls == [{"transport": "stdio"}, "sync"]
 
 
 def test_serve_proxy_starts_daemon_and_proxies(tmp_path, monkeypatch):

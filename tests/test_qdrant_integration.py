@@ -159,6 +159,18 @@ async def test_generation_match_checks_exact_point_ids(store):
 
 
 @pytest.mark.anyio
+async def test_inventory_orphan_cleanup_preserves_integer_point_ids(store):
+    ids = await store.replace_generation("orphan.md", "unfinished", [chunk("orphan.md")], file_hash="a" * 64)
+    record = (await store.client.retrieve(store.settings.collection_name, ids, with_vectors=True))[0]
+    await store.client.upsert(store.settings.collection_name, [
+        models.PointStruct(id=42, payload=record.payload, vector=record.vector),
+    ], wait=True)
+    inventory = await store.collection_inventory()
+    await store.cleanup_orphans({}, inventory=inventory)
+    assert (await store.client.count(store.settings.collection_name)).count == 0
+
+
+@pytest.mark.anyio
 async def test_filtered_rrf_and_per_source_cap(store, monkeypatch):
     from knowledge_mcp.search import SearchRequest
 
