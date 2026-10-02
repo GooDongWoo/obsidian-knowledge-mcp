@@ -247,6 +247,35 @@ def test_cpu_only_resources_do_not_touch_cuda_allocator(monkeypatch):
     embeddings.configure_torch_resources(4, .24)
 
 
+@pytest.mark.parametrize("backend", ["embedding", "reranker"])
+def test_integer_cuda_fraction_reaches_real_torch_validation(settings, monkeypatch, backend):
+    """Replace CUDA driver/model construction only; retain Torch type validation."""
+    from dataclasses import replace
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from torch.cuda import memory
+    from knowledge_mcp import embeddings
+    from knowledge_mcp.reranker import LocalReranker
+    native_calls = []
+    monkeypatch.setattr(memory, "_lazy_init", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch._C, "_cuda_setMemoryFraction",
+                        lambda fraction, device: native_calls.append((fraction, device)), raising=False)
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
+    monkeypatch.setattr(embeddings.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(embeddings, "_configured_cuda_budget", None)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(
+        SentenceTransformer=lambda *_: object(), CrossEncoder=lambda *_, **__: object()))
+    configured = replace(settings, cuda_memory_fraction=1)
+    provider = (embeddings.LocalSentenceTransformerProvider(settings.dense_model, settings=configured)
+                if backend == "embedding" else LocalReranker(settings=configured))
+    provider.warmup()
+    assert native_calls == [(1.0, 0)]
+    assert type(native_calls[0][0]) is float
+
+
 def test_model_inference_is_serialized_across_embedding_and_reranker(monkeypatch):
     import threading
     import sys

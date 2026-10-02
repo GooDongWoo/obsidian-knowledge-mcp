@@ -78,6 +78,7 @@ class Settings:
                     or not isinstance(self.cuda_memory_fraction, (int, float))
                     or not 0 < self.cuda_memory_fraction <= 1):
                 raise ValueError("cuda_memory_fraction must be greater than 0 and at most 1")
+            object.__setattr__(self, "cuda_memory_fraction", float(self.cuda_memory_fraction))
         if self.onnx_gpu_mem_limit is not None:
             if type(self.onnx_gpu_mem_limit) is not int or self.onnx_gpu_mem_limit < 1:
                 raise ValueError("onnx_gpu_mem_limit must be positive bytes")
