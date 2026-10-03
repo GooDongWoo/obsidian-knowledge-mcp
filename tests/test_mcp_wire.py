@@ -439,7 +439,7 @@ async def test_reranking_outcomes_keep_text_and_structured_wire_contract(applica
                 pytest.fail("explicit false constructed model")
             if policy == "init":
                 raise RuntimeError("private init payload")
-        def predict(self, pairs):
+        def predict(self, pairs, **kwargs):
             if policy == "inference":
                 raise RuntimeError("private inference payload")
             return [.2, .8] if policy == "default" else [float("nan")]
