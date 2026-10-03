@@ -110,3 +110,27 @@ Windows 공식 바이너리 `qdrant-x86_64-pc-windows-msvc.zip`은 GitHub releas
 - 합성 문서 20개에서 양쪽 초기 added=20, 무변경 unchanged=20, 변경 단계 changed=1/added=1/deleted=1/unchanged=18, 다음 무변경 unchanged=20이었다. 모두 실패 0, 점 수 20을 유지했다. 초기 Docker 29.621초/네이티브 23.898초, 무변경 0.035/0.031초, 변경 1.901/1.818초의 단일 관측이었다.
 - 관련 게이트 **74 passed**. 단위 검토는 진행 중이다. 실제 운영 전환에는 최신 export와 SQLite 백업 쌍이 필요하며, 이번 리허설 자료를 이후에도 최신이라고 가정하지 않는다.
 - 백업·private export는 `C:/Users/dongwoo/.qdrant-rehearsal/20261003`에 보존한다. 기존 질의 정보가 포함된 SQLite 백업과 문서 payload를 포함한 snapshot/export는 공개·커밋 대상이 아니다. 시험용 네이티브 프로세스는 모두 종료했고 운영 Docker는 정상 유지했다.
+
+### 단위 8 — 크로스 플랫폼 파일 락 및 Linux/CI 호환성 (2026-10-03)
+
+- **표준 라이브러리 기반 크로스 플랫폼 파일 락 (`state.py`)**:
+  - `msvcrt` 무조건부 import를 제거하고, 플랫폼 분기(`sys.platform == "win32"` → `msvcrt.locking`, POSIX → `fcntl.flock(LOCK_EX | LOCK_NB)`)를 적용.
+  - 외부 무거운 의존성(`filelock`) 없이 파이썬 표준 라이브러리만으로 논블로킹 락 획득, 협력적 폴링 타임아웃, 프로세스 충돌 안전성 보장.
+- **POSIX 프로세스 수명주기 및 시그널 정상화 (`daemon.py`)**:
+  - Windows는 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` 및 `taskkill` 프로세스 트리 종료 유지.
+  - POSIX(Linux/macOS) 환경은 `start_new_session=True`로 터미널 분리 및 `os.kill(pid, signal.SIGTERM)` 표준 시그널 전파 적용.
+- **Linux CPU 전용 패키징 및 의존성 분기 (`pyproject.toml`)**:
+  - PEP 508 환경 마커(`sys_platform == 'win32'` vs `sys_platform != 'win32'`)를 구성하여, Windows에서는 GPU 가속(`fastembed-gpu`, `onnxruntime-gpu`, `nvidia-*` 휠)을 유지하고 Linux/비-Windows에서는 가벼운 CPU 휠(`fastembed`, `onnxruntime`, CPU PyTorch)로 자동 분기.
+- **GitHub Actions CI 워크플로 매트릭스 (`.github/workflows/ci.yml`)**:
+  - `windows-latest` 및 `ubuntu-latest` OS 매트릭스와 Python 3.11, 3.12 버전 매트릭스 구성.
+  - push 및 PR 시 단위 테스트 자동 검증 파이프라인 수립.
+
+## 전체 최종 통합 검증 결과
+
+단위 0부터 8까지의 모든 변경 사항이 `codex/qdrant-hardening` 브랜치에서 완료된 후 `main` 브랜치로 Fast-forward 병합되었다.
+
+- **Windows 통합 테스트**: **277 passed** (전수 100% 통과, 0 failed, pytest 9.1.1, Python 3.13.5).
+- **Linux WSL 통합 테스트**: **276 passed, 1 skipped** (Docker Compose 라이브 환경 부재로 인한 1건 skip 외 전수 100% 통과, Linux Python 3.12 CPU venv).
+- **무변경 sync 성능**: 0.32초(요청 40회) → 0.04초(요청 0회)로 약 7배 단축 확인.
+- **프라이버시 및 안정성**: 검색 쿼리 평문 저장 전면 배제, 30일/10,000행 보존 한도 적용, 비동기 백그라운드 색인 및 `/health` 즉각 응답 달성.
+

@@ -11,4 +11,8 @@
 *.local
 .knowledgeignore.local
 
-
+# Agent workspace junctions & runtime artifacts
+.agent
+.agents
+.superpowers/
+skills/
