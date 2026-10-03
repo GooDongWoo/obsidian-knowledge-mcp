@@ -161,10 +161,15 @@ run_daemon(settings, port={port})
 ''', encoding="utf-8")
     env = {**os.environ, "FASTMCP_CHECK_FOR_UPDATES": "off", "FASTMCP_TELEMETRY_MODE": "off",
            "FASTMCP_SHOW_SERVER_BANNER": "false", "PYTHONUTF8": "1"}
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
     with (tmp_path / "daemon.log").open("w") as log:
         child = subprocess.Popen([sys.executable, str(script)], env=env,
                                  stdout=log, stderr=log,
-                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                                 **popen_kwargs)
         try:
             async with httpx2.AsyncClient() as http:
                 with anyio.fail_after(30):
@@ -193,8 +198,11 @@ run_daemon(settings, port={port})
             assert not (tmp_path / "overlap").exists()
         finally:
             if child.poll() is None:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
-                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                                   capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    child.terminate()
             child.wait(timeout=10)
 
 

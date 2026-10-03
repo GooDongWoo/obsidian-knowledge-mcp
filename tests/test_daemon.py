@@ -1,4 +1,6 @@
 from pathlib import Path
+import signal
+import sys
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -118,6 +120,7 @@ def test_start_daemon_process_launches(settings):
         assert mock_popen.call_args.kwargs["stderr"] == __import__("subprocess").DEVNULL
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only headless process flags")
 def test_start_daemon_process_win32_headless(settings):
     import subprocess
     mock_proc = MagicMock()
@@ -139,6 +142,23 @@ def test_start_daemon_process_win32_headless(settings):
         assert args[0].endswith("pythonw.exe")
 
 
+def test_start_daemon_process_posix_session(settings):
+    mock_proc = MagicMock()
+    mock_proc.pid = 9999
+    mock_proc.poll.return_value = None
+
+    with patch("knowledge_mcp.daemon.is_daemon_running", side_effect=[False, False, True]), \
+         patch("sys.platform", "linux"), \
+         patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        pid = start_daemon_process(settings, port=8765, timeout=5.0)
+        assert pid == 9999
+        assert mock_popen.called
+        kwargs = mock_popen.call_args.kwargs
+        assert kwargs.get("start_new_session") is True
+        assert "creationflags" not in kwargs
+        assert "startupinfo" not in kwargs
+
+
 def test_stop_daemon_process(settings):
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
     (settings.runtime_dir / "daemon.pid").write_text("9999", encoding="utf-8")
@@ -149,10 +169,31 @@ def test_stop_daemon_process(settings):
         return running_states.pop(0) if running_states else False
 
     with patch("knowledge_mcp.daemon.is_daemon_running", side_effect=fake_is_running), \
-         patch("subprocess.run") as mock_run:
+         patch("subprocess.run") as mock_run, \
+         patch("os.kill") as mock_kill:
         stopped = stop_daemon_process(settings, port=8765, timeout=2.0)
         assert stopped is True
         assert not (settings.runtime_dir / "daemon.pid").exists()
+        if sys.platform == "win32":
+            assert mock_run.called
+            assert mock_run.call_args.args[0] == ["taskkill", "/F", "/PID", "9999"]
+        else:
+            mock_kill.assert_called_once_with(9999, signal.SIGTERM)
+
+
+def test_stop_daemon_process_posix(settings):
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    (settings.runtime_dir / "daemon.pid").write_text("9999", encoding="utf-8")
+
+    with patch("knowledge_mcp.daemon.is_daemon_running", side_effect=[True, False]), \
+         patch("sys.platform", "linux"), \
+         patch("subprocess.run") as mock_run, \
+         patch("os.kill") as mock_kill:
+        stopped = stop_daemon_process(settings, port=8765, timeout=2.0)
+        assert stopped is True
+        assert not (settings.runtime_dir / "daemon.pid").exists()
+        assert not mock_run.called
+        mock_kill.assert_called_once_with(9999, signal.SIGTERM)
 
 
 def test_startup_timeout_terminates_owned_child_before_unlock(settings):
@@ -163,7 +204,24 @@ def test_startup_timeout_terminates_owned_child_before_unlock(settings):
          patch("subprocess.run") as kill:
         with pytest.raises(TimeoutError):
             start_daemon_process(settings, timeout=0)
-    assert kill.call_args.args[0] == ["taskkill", "/F", "/T", "/PID", "9999"]
+    if sys.platform == "win32":
+        assert kill.call_args.args[0] == ["taskkill", "/F", "/T", "/PID", "9999"]
+    else:
+        process.terminate.assert_called_once()
+    process.wait.assert_called_once()
+
+
+def test_startup_timeout_terminates_owned_child_posix(settings):
+    process = MagicMock(pid=9999)
+    process.poll.return_value = None
+    with patch("knowledge_mcp.daemon.is_daemon_running", return_value=False), \
+         patch("sys.platform", "linux"), \
+         patch("subprocess.Popen", return_value=process), \
+         patch("subprocess.run") as kill:
+        with pytest.raises(TimeoutError):
+            start_daemon_process(settings, timeout=0)
+    process.terminate.assert_called_once()
+    assert not kill.called
     process.wait.assert_called_once()
 
 

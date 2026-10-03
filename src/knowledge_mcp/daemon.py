@@ -10,6 +10,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -180,13 +181,16 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
     env["KNOWLEDGE_DENSE_MODEL"] = settings.dense_model
     env["KNOWLEDGE_DAEMON_BACKGROUND"] = "1"
 
-    creationflags = 0
-    startupinfo = None
+    popen_kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
+        popen_kwargs["creationflags"] = creationflags
+        popen_kwargs["startupinfo"] = startupinfo
+    else:
+        popen_kwargs["start_new_session"] = True
 
     # The child installs rotating safe streams. An inherited raw file handle
     # would bypass both privacy filtering and rotation for its entire lifetime.
@@ -196,10 +200,9 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
-        startupinfo=startupinfo,
         env=env,
         close_fds=True,
+        **popen_kwargs,
     )
 
     deadline = time.monotonic() + timeout
@@ -247,7 +250,7 @@ def stop_daemon_process(
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
-                os.kill(pid, 15)  # SIGTERM
+                os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
 
