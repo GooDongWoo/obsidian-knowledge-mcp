@@ -1,5 +1,5 @@
-import msvcrt
 import sqlite3
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -419,32 +419,141 @@ def test_index_lock_releases_after_context_exit(tmp_path):
 
 
 def test_index_lock_releases_when_indexer_fails(tmp_path, monkeypatch):
-    modes = []
+    if sys.platform == "win32":
+        import msvcrt
 
-    def capture_lock(_descriptor, mode, _length):
-        modes.append(mode)
+        modes = []
 
-    monkeypatch.setattr("knowledge_mcp.state.msvcrt.locking", capture_lock)
-    with pytest.raises(RuntimeError, match="failed index"):
-        with index_lock(tmp_path):
-            raise RuntimeError("failed index")
-    assert modes[-1] == msvcrt.LK_UNLCK
+        def capture_lock(_descriptor, mode, _length):
+            modes.append(mode)
+
+        monkeypatch.setattr("knowledge_mcp.state.msvcrt.locking", capture_lock)
+        with pytest.raises(RuntimeError, match="failed index"):
+            with index_lock(tmp_path):
+                raise RuntimeError("failed index")
+        assert modes[-1] == msvcrt.LK_UNLCK
+    else:
+        import fcntl
+
+        ops = []
+
+        def capture_flock(_descriptor, op):
+            ops.append(op)
+
+        monkeypatch.setattr("knowledge_mcp.state.fcntl.flock", capture_flock)
+        with pytest.raises(RuntimeError, match="failed index"):
+            with index_lock(tmp_path):
+                raise RuntimeError("failed index")
+        assert ops[-1] == fcntl.LOCK_UN
 
 
 def test_index_lock_retries_more_than_msvcrt_blocking_limit(tmp_path, monkeypatch):
     attempts = 0
 
-    def contend(_descriptor, mode, _length):
-        nonlocal attempts
-        if mode == msvcrt.LK_NBLCK:
-            attempts += 1
-            if attempts <= 11:
-                raise OSError("lock held")
+    if sys.platform == "win32":
+        import msvcrt
 
-    monkeypatch.setattr("knowledge_mcp.state.msvcrt.locking", contend)
+        def contend(_descriptor, mode, _length):
+            nonlocal attempts
+            if mode == msvcrt.LK_NBLCK:
+                attempts += 1
+                if attempts <= 11:
+                    raise OSError("lock held")
+
+        monkeypatch.setattr("knowledge_mcp.state.msvcrt.locking", contend)
+    else:
+        import fcntl
+
+        def contend(_descriptor, op):
+            nonlocal attempts
+            if op == (fcntl.LOCK_EX | fcntl.LOCK_NB):
+                attempts += 1
+                if attempts <= 11:
+                    raise OSError("lock held")
+
+        monkeypatch.setattr("knowledge_mcp.state.fcntl.flock", contend)
+
     monkeypatch.setattr(state, "time", SimpleNamespace(sleep=lambda _seconds: None), raising=False)
 
     with index_lock(tmp_path):
         pass
 
     assert attempts == 12
+
+
+def test_windows_locking_primitives_contract():
+    calls = []
+    fake_msvcrt = SimpleNamespace(
+        LK_NBLCK=2,
+        LK_UNLCK=0,
+        locking=lambda fd, mode, length: calls.append((fd, mode, length)),
+    )
+
+    def win_lock(fd: int) -> None:
+        fake_msvcrt.locking(fd, fake_msvcrt.LK_NBLCK, 1)
+
+    def win_unlock(fd: int) -> None:
+        fake_msvcrt.locking(fd, fake_msvcrt.LK_UNLCK, 1)
+
+    win_lock(42)
+    assert calls[-1] == (42, 2, 1)
+    win_unlock(42)
+    assert calls[-1] == (42, 0, 1)
+
+
+def test_posix_locking_primitives_contract():
+    calls = []
+    fake_fcntl = SimpleNamespace(
+        LOCK_EX=2,
+        LOCK_NB=4,
+        LOCK_UN=8,
+        flock=lambda fd, op: calls.append((fd, op)),
+    )
+
+    def posix_lock(fd: int) -> None:
+        fake_fcntl.flock(fd, fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB)
+
+    def posix_unlock(fd: int) -> None:
+        fake_fcntl.flock(fd, fake_fcntl.LOCK_UN)
+
+    posix_lock(42)
+    assert calls[-1] == (42, 6)
+    posix_unlock(42)
+    assert calls[-1] == (42, 8)
+
+
+@pytest.mark.anyio
+async def test_async_index_lock_releases_after_context_exit(tmp_path):
+    async with state.async_index_lock(tmp_path):
+        assert (tmp_path / "index.lock").is_file()
+
+    async with state.async_index_lock(tmp_path):
+        pass
+
+
+@pytest.mark.anyio
+async def test_async_index_lock_releases_when_indexer_fails(tmp_path, monkeypatch):
+    if sys.platform == "win32":
+        import msvcrt
+
+        modes = []
+        monkeypatch.setattr(
+            "knowledge_mcp.state.msvcrt.locking",
+            lambda _d, mode, _l: modes.append(mode),
+        )
+        with pytest.raises(RuntimeError, match="async failed index"):
+            async with state.async_index_lock(tmp_path):
+                raise RuntimeError("async failed index")
+        assert modes[-1] == msvcrt.LK_UNLCK
+    else:
+        import fcntl
+
+        ops = []
+        monkeypatch.setattr(
+            "knowledge_mcp.state.fcntl.flock",
+            lambda _d, op: ops.append(op),
+        )
+        with pytest.raises(RuntimeError, match="async failed index"):
+            async with state.async_index_lock(tmp_path):
+                raise RuntimeError("async failed index")
+        assert ops[-1] == fcntl.LOCK_UN

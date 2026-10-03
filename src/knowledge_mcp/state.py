@@ -7,11 +7,11 @@ from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
-import msvcrt
 import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 from typing import Iterator, Mapping, Sequence, Sized
 import warnings
@@ -219,16 +219,34 @@ class OperationLog:
         return _database_text(self.runtime_dir)
 
 
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_nonblocking(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _unlock(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_nonblocking(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 @contextmanager
 def index_lock(runtime_dir: Path, *, lock_name: str = "index.lock") -> Iterator[None]:
-    """Serialize indexers with a Windows advisory lock, releasing it always."""
+    """Serialize indexers with an advisory lock, releasing it always."""
     directory = Path(runtime_dir)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / lock_name).open("a+b") as lock_file:
         lock_file.seek(0)
         while True:
             try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                _lock_nonblocking(lock_file.fileno())
                 break
             except OSError:
                 time.sleep(0.1)
@@ -241,7 +259,7 @@ def index_lock(runtime_dir: Path, *, lock_name: str = "index.lock") -> Iterator[
             yield
         finally:
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            _unlock(lock_file.fileno())
 
 
 @asynccontextmanager
@@ -253,7 +271,7 @@ async def async_index_lock(runtime_dir: Path):
         lock_file.seek(0)
         while True:
             try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                _lock_nonblocking(lock_file.fileno())
                 break
             except OSError:
                 await asyncio.sleep(0.1)
@@ -264,7 +282,7 @@ async def async_index_lock(runtime_dir: Path):
             yield
         finally:
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            _unlock(lock_file.fileno())
 
 
 async def run_blocking(function, /, *args, **kwargs):
