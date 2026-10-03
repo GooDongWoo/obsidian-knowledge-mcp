@@ -7,16 +7,18 @@ dependencies = [
   "fastmcp==4.0.10",
   "mcp==2.2.0",
   "anyio>=4.9,<5",
-  "fastembed-gpu==0.8.0",
   "sentence-transformers>=3,<6",
-  "onnxruntime-gpu==1.26.0",
-  "nvidia-cuda-runtime-cu12==12.8.90",
-  "nvidia-cufft-cu12==11.4.1.4",
-  "nvidia-cudnn-cu12==9.7.0.66",
   "qdrant-client>=1.14,<2",
   "pypdf>=5,<7",
   "pathspec>=0.12,<1",
   "PyYAML>=6,<7",
+  "fastembed-gpu==0.8.0; sys_platform == 'win32'",
+  "fastembed==0.8.0; sys_platform != 'win32'",
+  "onnxruntime-gpu==1.26.0; sys_platform == 'win32'",
+  "onnxruntime==1.26.0; sys_platform != 'win32'",
+  "nvidia-cuda-runtime-cu12==12.8.90; sys_platform == 'win32'",
+  "nvidia-cufft-cu12==11.4.1.4; sys_platform == 'win32'",
+  "nvidia-cudnn-cu12==9.7.0.66; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

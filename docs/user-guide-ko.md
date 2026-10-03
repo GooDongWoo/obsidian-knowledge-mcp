@@ -37,9 +37,14 @@ Streamable HTTP는 `/mcp` 하나에서 POST 요청과 JSON 또는 **요청별 SS
 
 ---
 
-## 2. 빠른 시작 (PowerShell 설정)
+## 2. 빠른 시작 (설치 및 환경 설정)
 
-Python `3.11` 이상을 사용합니다. 새 checkout에서 가상환경을 만든 뒤 설치하세요. Windows Python `3.13` CUDA 환경을 재현할 때는 다음 constraints를 사용합니다.
+Python `3.11` 이상을 사용합니다. 새 checkout에서 가상환경을 만든 뒤 설치하세요. `obsidian-knowledge-mcp`는 PEP 508 환경 마커(`sys_platform == 'win32'` vs `sys_platform != 'win32'`)를 사용하여 Windows(GPU 가속)와 Linux(CPU 전용) 의존성을 자동 분기합니다.
+
+### 2.1 가상환경 생성 및 설치
+
+#### Windows (CUDA 가속 권장)
+Windows Python `3.13` CUDA 환경을 재현할 때는 다음 constraints를 사용합니다.
 
 ```powershell
 python -m venv .venv
@@ -52,21 +57,54 @@ $candidatePython = Join-Path (Get-Location) '.venv\Scripts\python.exe'
 
 이 constraints는 해당 Windows/GPU 환경의 재설치 기준이며 다른 플랫폼의 lockfile이 아닙니다. 다른 환경에서는 새 가상환경에 `python -m pip install -e .`로 설치하고 `python -m pip check`를 확인하세요. `qdrant-mcp` extra는 제거되었습니다. 구 `mcp-server-qdrant==0.8.1`이 FastMCP `2.7.0`과 Pydantic `<2.12.0`을 고정하므로 필요하면 별도의 FastMCP 2 환경에서 사용합니다.
 
+#### Linux / WSL (CPU 모드)
+Linux 및 WSL 환경에서는 불필요한 대용량 NVIDIA CUDA runtime wheel 다운로드를 방지하기 위해 PyTorch CPU 전용 인덱스를 사전 설치한 후 패키지를 설치합니다:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+
+# PyTorch CPU 빌드 사전 설치 (대용량 CUDA wheel 방지)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# 패키지 설치 (pyproject.toml 마커에 의해 fastembed, onnxruntime CPU 버전 자동 설치)
+pip install -e .
+pip check
+```
+
+> [!NOTE]
+> `pyproject.toml`에서 `sys_platform != 'win32'`일 경우 `fastembed-gpu`, `onnxruntime-gpu`, `nvidia-*` 패키지가 제외되고 경량 `fastembed`, `onnxruntime` CPU 휠이 설치됩니다.
+
 기존 설치에서 전환할 때는 **별도 checkout/worktree에 새 `.venv`를 생성**합니다. 원래 checkout과 editable 가상환경 및 클라이언트 설정은 롤백용으로 그대로 보존하고, 원래 환경을 제자리 업그레이드하거나 가상환경을 복사하여 재사용하지 마세요. 프로토콜 전환에 모델 변경, 컬렉션 재생성, SQLite/Qdrant 포맷 변경은 필요하지 않습니다.
 
-Windows PowerShell에서 환경변수를 설정합니다. 이후 명령은 **동일한 PowerShell 세션**에서 실행합니다.
+### 2.2 환경변수 설정
 
-```powershell
-# Vault 경로 및 프로젝트 경로 설정 (환경에 맞게 수정)
-# 또는 프로젝트 루트의 .env 파일에 설정할 수도 있습니다 (.env.example 참고).
-$env:KNOWLEDGE_VAULT_ROOT = 'C:\Path\To\Your\Obsidian'
-$env:KNOWLEDGE_PROJECT_ROOT = 'C:\Path\To\obsidian-knowledge-mcp'
+환경에 맞게 Vault 경로와 프로젝트 경로를 설정합니다:
 
-$project = $env:KNOWLEDGE_PROJECT_ROOT
-$vault = $env:KNOWLEDGE_VAULT_ROOT
-$mcp = Join-Path $project '.venv\Scripts\knowledge-mcp.exe'
-$python = Join-Path $project '.venv\Scripts\python.exe'
-```
+- **Windows PowerShell**:
+  ```powershell
+  # Vault 경로 및 프로젝트 경로 설정 (환경에 맞게 수정)
+  # 또는 프로젝트 루트의 .env 파일에 설정할 수도 있습니다 (.env.example 참고).
+  $env:KNOWLEDGE_VAULT_ROOT = 'C:\Path\To\Your\Obsidian'
+  $env:KNOWLEDGE_PROJECT_ROOT = 'C:\Path\To\obsidian-knowledge-mcp'
+
+  $project = $env:KNOWLEDGE_PROJECT_ROOT
+  $vault = $env:KNOWLEDGE_VAULT_ROOT
+  $mcp = Join-Path $project '.venv\Scripts\knowledge-mcp.exe'
+  $python = Join-Path $project '.venv\Scripts\python.exe'
+  ```
+
+- **Linux / WSL (bash)**:
+  ```bash
+  # Vault 경로 및 프로젝트 경로 설정 (환경에 맞게 수정)
+  # 또는 프로젝트 루트의 .env 파일에 설정할 수도 있습니다 (.env.example 참고).
+  export KNOWLEDGE_VAULT_ROOT="/path/to/your/Obsidian"
+  export KNOWLEDGE_PROJECT_ROOT="/path/to/obsidian-knowledge-mcp"
+
+  export MCP="$KNOWLEDGE_PROJECT_ROOT/.venv/bin/knowledge-mcp"
+  export PYTHON="$KNOWLEDGE_PROJECT_ROOT/.venv/bin/python"
+  ```
 
 프로젝트 `.env`는 FastMCP import보다 먼저 읽히며 데몬 자식 프로세스에도 설정이 상속됩니다. `.env.example`의 기본값을 사용하고 데몬은 localhost에 바인딩합니다.
 

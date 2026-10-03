@@ -97,8 +97,10 @@ Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-
 
 ### 3.1 Prerequisites
 - **Python**: 3.11 or higher
-- **Qdrant 1.19.1**: Official native executable; Docker Desktop is optional for rollback.
-- **NVIDIA GPU** (Recommended): CUDA 12.x compatible GPU for fast embedding inference (falls back to CPU if unavailable).
+- **Qdrant 1.19.1**: Official native executable (Windows/Linux); Docker Desktop is optional for rollback.
+- **Hardware Acceleration**:
+  - **Windows (GPU Recommended)**: CUDA 12.x compatible GPU for fast embedding inference (falls back to CPU if unavailable).
+  - **Linux / WSL (CPU Mode Supported)**: Optimized CPU inference via PyTorch CPU and lightweight CPU FastEmbed/ONNX Runtime.
 
 ### 3.2 Setup Steps
 
@@ -109,28 +111,52 @@ Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-
    ```
 
 2. **Create and activate a virtual environment**:
-   ```powershell
-   # Windows PowerShell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+   - **Windows (PowerShell)**:
+     ```powershell
+     python -m venv .venv
+     .\.venv\Scripts\Activate.ps1
+     ```
+   - **Linux / WSL (bash)**:
+     ```bash
+     python3 -m venv .venv
+     source .venv/bin/activate
+     ```
 
-3. **Install PyTorch with CUDA support** (Optional, for GPU acceleration):
-   ```powershell
-   python -m pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-   ```
+3. **Install PyTorch**:
+   - **Windows (with CUDA 12.8 support)**:
+     ```powershell
+     python -m pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+     ```
+   - **Linux / WSL (CPU mode)**:
+     Install the lightweight CPU-only PyTorch build first to prevent pip from downloading multi-gigabyte CUDA runtime wheels:
+     ```bash
+     pip install torch --index-url https://download.pytorch.org/whl/cpu
+     ```
 
 4. **Install dependencies**:
-   ```powershell
-   python -m pip install -e .
-   python -m pip check
-   ```
-   To reproduce the Windows Python 3.13 CUDA environment, install the CUDA PyTorch build above first, then use `python -m pip install -c constraints/fastmcp4-windows-py313.txt -e '.[dev]'`. This constraints file describes that environment; it is not a cross-platform lockfile. FastMCP is pinned to `4.0.10` and the MCP SDK to `2.2.0`.
+   - **Windows**:
+     ```powershell
+     python -m pip install -e .
+     python -m pip check
+     ```
+     To reproduce the Windows Python 3.13 CUDA environment, install the CUDA PyTorch build above first, then use `python -m pip install -c constraints/fastmcp4-windows-py313.txt -e '.[dev]'`. This constraints file describes that environment; it is not a cross-platform lockfile. FastMCP is pinned to `4.0.10` and the MCP SDK to `2.2.0`.
+   - **Linux / WSL**:
+     ```bash
+     pip install -e .
+     pip check
+     ```
+     > [!NOTE]
+     > `pyproject.toml` uses PEP 508 platform markers (`sys_platform == 'win32'` vs `sys_platform != 'win32'`). On Windows, GPU wheels (`fastembed-gpu`, `onnxruntime-gpu`, `nvidia-*`) are selected. On Linux/macOS, standard CPU wheels (`fastembed`, `onnxruntime`) are installed automatically without heavyweight NVIDIA GPU runtime wheels.
 
-   Verify GPU availability:
-   ```powershell
-   python -c "import torch; print('CUDA Available:', torch.cuda.is_available())"
-   ```
+5. **Verify runtime device**:
+   - **Windows (GPU verification)**:
+     ```powershell
+     python -c "import torch; print('CUDA Available:', torch.cuda.is_available())"
+     ```
+   - **Linux / WSL (CPU verification)**:
+     ```bash
+     python -c "import torch; print('PyTorch device:', 'cuda' if torch.cuda.is_available() else 'cpu')"
+     ```
 
 The `qdrant-mcp` extra has been removed: its old `mcp-server-qdrant==0.8.1` dependency pins FastMCP `2.7.0` and Pydantic `<2.12.0`. If you need that separate server, keep it in a separate FastMCP 2 environment.
 
