@@ -1,5 +1,155 @@
 # Qdrant 상태 진단 및 색인 모니터링 가이드
 
+<a id="native-qdrant-migration"></a>
+## Windows 네이티브 Qdrant 이행과 롤백
+
+### 실행 파일과 저장소
+
+[공식 v1.19.1 Windows 릴리스](https://github.com/qdrant/qdrant/releases/tag/v1.19.1)의 `qdrant-x86_64-pc-windows-msvc.zip`을 사용합니다. 검증된 archive SHA-256은 `9b6f69bd85f6abed4bc13f943099f55c6ffd55f5dd90388635320d8fbb569eb0`입니다. `Get-FileHash -Algorithm SHA256 <archive>`로 확인하고 도구 폴더에 압축을 풉니다.
+
+`KNOWLEDGE_QDRANT_EXECUTABLE`에는 실행 파일의 절대 경로를 지정합니다. PATH 조회도 지원하지만 무인 실행에는 절대 경로를 권장합니다. `KNOWLEDGE_QDRANT_BACKEND=native`가 기본값이며, localhost health가 정상이면 backend 설정과 관계없이 기존 서버를 재사용합니다. 일반 CLI 실행에는 서비스 등록이 필요하지 않습니다.
+
+`KNOWLEDGE_QDRANT_NATIVE_STORAGE`는 새 네이티브 저장소의 절대 경로입니다. 생략하면 사용자 홈의 `.knowledge-qdrant/<프로젝트 경로 SHA-256 앞 12자리>`를 사용합니다. Windows의 깊은 checkout/임시 폴더 아래에서는 Gridstore가 긴 경로 오류를 낼 수 있으므로 짧은 경로를 사용하세요. 런처는 빈 저장소에만 `.knowledge-native-owner.json`을 만들고 재시작 시 확인합니다. 표식 없는 nonempty 저장소는 거부합니다. Docker 폴더를 이름 변경하거나 표식을 직접 만들어 우회하지 마세요.
+
+기존 `KNOWLEDGE_QDRANT_STORAGE`는 Docker bind mount 전용입니다(기본 `.knowledge/qdrant`). 두 환경이 저장소를 공유하지 않습니다. 런처는 loopback, 절대 storage/snapshots/tmp 경로, telemetry off를 설정합니다. 네이티브 저장소의 `native.log`와 `native.previous.log`는 현재/직전 실행의 WARN 이상 진단을 보관합니다. 일반 런처 로그는 시작할 때 교체되며 실행 중 크기 회전은 하지 않습니다. 상시 서비스는 아래 WinSW 회전을 사용하세요.
+
+### 백업과 별도 포트 복원
+
+원본 Docker 6333과 MCP 8765를 유지한 리허설에서는 snapshot 생성과 SQLite backup API를 같은 writer lock 범위에서 실행합니다. 운영 runtime에 새 `OperationLog`를 생성하면 DB 마이그레이션이 실행될 수 있으므로 사용하지 않습니다. 다음 예시의 경로를 실제 원본/새 백업 경로로 바꿉니다. 백업은 private 문서와 과거 질의 기록을 포함할 수 있으므로 접근을 제한하고 Git/공유 로그에 넣지 않습니다.
+
+```python
+from pathlib import Path
+from contextlib import closing
+import json, sqlite3
+import httpx
+from knowledge_mcp.state import index_lock
+
+live = Path("C:/Path/To/original-project/.knowledge")
+backup = Path("C:/Users/YourName/qdrant-backup/2026-10-03")
+backup.mkdir(parents=True, exist_ok=False)
+name = "obsidian_knowledge_bge_m3_ko_v1"
+with index_lock(live), httpx.Client(base_url="http://127.0.0.1:6333", timeout=600) as client:
+    with closing(sqlite3.connect((live / "state.sqlite3").as_uri() + "?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(backup / "state.sqlite3")) as target:
+            source.backup(target)
+            assert target.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    aliases = client.get("/aliases")
+    aliases.raise_for_status()
+    (backup / "aliases.json").write_text(json.dumps(aliases.json()), encoding="utf-8")
+    response = client.post(f"/collections/{name}/snapshots")
+    response.raise_for_status()
+    snapshot = response.json()["result"]["name"]
+    with client.stream("GET", f"/collections/{name}/snapshots/{snapshot}") as response:
+        response.raise_for_status()
+        with (backup / "collection.snapshot").open("xb") as output:
+            for block in response.iter_bytes():
+                output.write(block)
+```
+
+[Snapshot 호환 조건](https://qdrant.tech/documentation/operations/snapshots/)은 같은 minor 또는 다음 minor 버전 복원입니다. 여기서는 1.19.1 → 1.19.1을 검증합니다. Collection snapshot에는 alias가 없으므로 별도 목록을 확인하고 필요한 alias를 대상에 재생성합니다. [복원 디스크 요구량](https://qdrant.tech/documentation/migration-recovery-options/)에 따라 collection 크기의 약 2배 여유 공간을 확보하세요.
+
+리허설은 새 빈 저장소와 별도 포트 16333/16334를 사용합니다. `Settings.from_env()`의 운영 URL 정책은 유지하고 시험 코드에서만 포트를 바꿉니다.
+
+```python
+from dataclasses import replace
+from pathlib import Path
+from knowledge_mcp.config import Settings
+from knowledge_mcp.cli import ensure_qdrant
+
+settings = replace(
+    Settings.from_paths(vault_root=Path("C:/test/vault"), project_root=Path("C:/test/project")),
+    qdrant_url="http://127.0.0.1:16333",
+    qdrant_executable="C:/Tools/qdrant-1.19.1/qdrant.exe",
+    qdrant_native_storage=Path("C:/Users/YourName/qdrant-rehearsal"),
+)
+ensure_qdrant(settings)
+```
+
+```powershell
+curl.exe --fail -X POST "http://127.0.0.1:16333/collections/obsidian_knowledge_bge_m3_ko_v1/snapshots/upload?priority=snapshot&wait=true" -F "snapshot=@C:/Users/YourName/qdrant-backup/2026-10-03/collection.snapshot"
+$env:KNOWLEDGE_TEST_QDRANT_URL = "http://127.0.0.1:16333"
+python -m pytest tests/test_qdrant_integration.py -q
+```
+
+새 collection 복원은 `priority=snapshot`을 명시합니다. 복원 후 exact count, dense 1024/Cosine, BM25 IDF, collection metadata, payload index 7개, alias, ID/세대/본문·벡터 일치, 한글 dense/BM25/RRF 및 실제 rerank 적용·순서를 비교합니다. 결과 원문 대신 개수와 일치 여부만 기록하세요. GPU 여유가 작으면 실제 질의 벡터를 별도 프로세스에서 계산하고 종료한 뒤 리랭커를 로드합니다. 증분 sync는 별도 UUID collection과 합성 Vault에서 검증합니다. 운영 복제 collection/manifest를 합성 파일만으로 sync하면 원본 데이터가 삭제될 수 있습니다.
+
+### Snapshot 실패 시 API 복제 검증
+
+2026-10-03 리허설에서는 snapshot의 `0/wal/first-index`가 18개의 NUL byte여서 네이티브 1.19.1이 WAL JSON 오류로 복원을 거부했습니다. [관련 upstream 보고](https://github.com/qdrant/qdrant/issues/7956)가 있지만 이 설치에서의 해결은 확인되지 않았습니다. 버전 일치만으로 snapshot 복원 가능성을 보장하지 못합니다. 원본 snapshot/hash를 보존하고 WAL을 직접 고치지 않습니다. 이 경로의 운영 전환은 복원 검증을 통과할 때까지 보류합니다.
+
+대안은 [공식 migration 문서의 stream/upsert 방식](https://qdrant.tech/documentation/migration-recovery-options/)입니다. writer lock 아래 `scroll(limit=128, with_payload=True, with_vectors=True)`를 offset이 없어질 때까지 호출하여 ID·payload·dense/sparse vector를 로컬 JSONL로 보존합니다. 같은 lock 범위에서 read-only SQLite backup, exact count, collection config/index/alias 및 비교용 검색 결과를 기록합니다. 출력에는 본문을 포함하지 않습니다.
+
+대상은 또 다른 새 owned 저장소여야 합니다. 원본 `get_collection().config`에서 vectors, sparse_vectors, shard/replication/write_consistency, on_disk_payload, HNSW, optimizer, WAL, quantization, metadata 설정을 `create_collection()`에 전달하고 payload index를 원래 타입으로 만듭니다. 클라이언트의 HNSW/optimizer/WAL 생성 인수는 Diff 모델을 받으므로 조회한 전체 모델은 `.model_dump(exclude_none=True)`로 변환해 전달합니다. 저장된 각 레코드로 `models.PointStruct(id=record["id"], vector=record["vector"], payload=record["payload"])`를 만들어 `upsert(..., wait=True)`에 64개씩 전달합니다. 재임베딩하지 않으며 HNSW 재구축 시간/자원이 추가로 필요합니다. [Scroll API](https://api.qdrant.tech/api-reference/points/scroll-points), [Upsert API](https://api.qdrant.tech/api-reference/points/upsert-points)를 따릅니다.
+
+복제 후 위 검증을 모두 수행합니다. Cosine 벡터는 upsert 때 정규화될 수 있으므로 float32 오차가 있으면 최대 절대 차이와 검색 점수·순서를 함께 검증하고 허용 오차를 기록합니다. ID/payload/세대와 sparse 정보는 별도로 정확히 비교합니다. API 복제가 성공해도 snapshot 실패가 해결된 것으로 기록하지 않습니다.
+
+### 검증 후 전환 및 롤백
+
+1. MCP와 모든 writer를 중지하고 최종 백업 쌍을 보존합니다. 원본 checkout/runtime/환경은 그대로 두고 새 runtime은 백업 SQLite의 복사본을 사용합니다.
+2. 검증한 방법으로 최종 데이터를 새 네이티브 저장소에 복원하고 비교를 다시 통과시킵니다. 오래된 리허설 백업으로 바로 전환하지 않습니다.
+3. 리허설 프로세스를 종료하고 원래 Compose의 `stop qdrant`로 원본 컨테이너만 중지합니다. `down -v`나 WSL 전체 종료를 사용하지 않습니다.
+4. 새 checkout 환경에 executable/native storage를 명시하고 네이티브 6333/6334, MCP 8765를 시작합니다. 일반 런처라면 실행 파일/저장소를 확인한 해당 PID만 관리합니다.
+5. health, count, 검색/rerank, modern/legacy 도구 목록, 색인 상태를 재확인합니다. `vmmemWSL`, 전체 프로세스 RSS, native RSS, 기동/증분 색인 시간을 같은 조건에서 비교합니다. 다른 WSL 작업의 메모리까지 제거됐다고 해석하지 않습니다.
+
+복원/동작 검증 실패 또는 자원 이득이 확인되지 않으면 새 MCP/네이티브를 중지하고 원래 checkout·환경·runtime으로 복구합니다. 전환 후 변경분이 있다면 양쪽 백업을 먼저 보존하고 재동기화 범위를 결정합니다. 다른 시점의 SQLite와 Qdrant를 임의로 섞지 않습니다.
+
+```powershell
+$env:KNOWLEDGE_QDRANT_BACKEND = "docker"
+$env:KNOWLEDGE_QDRANT_STORAGE = "C:/Path/To/original-project/.knowledge/qdrant"
+docker compose -f "C:/Path/To/original-project/docker-compose.yml" up -d
+# 원래 checkout/가상환경/설정으로 MCP를 재시작하고 검증합니다.
+```
+
+Compose와 원본 저장소 정리는 롤백 보존 기간 후 별도로 결정합니다.
+
+### 선택적 Windows 자동 시작 서비스
+
+자동 시작이 필요할 때만 [WinSW 2.12.0 공식 릴리스](https://github.com/winsw/winsw/releases/tag/v2.12.0)의 x64 wrapper를 `C:/Tools/qdrant-service/QdrantService.exe`로 저장하고 같은 이름의 XML을 만듭니다. [2.12 XML 설정](https://github.com/winsw/winsw/blob/v2.12.0/doc/xmlConfigFile.md)과 [로그 회전](https://github.com/winsw/winsw/blob/v2.12.0/doc/loggingAndErrorReporting.md)을 사용하는 예이며 서비스 설치는 별도 운영 단계입니다.
+
+```xml
+<service>
+  <id>KnowledgeQdrant</id>
+  <name>Knowledge Qdrant</name>
+  <executable>C:/Tools/qdrant-1.19.1/qdrant.exe</executable>
+  <arguments>--config-path C:/Tools/qdrant-service/qdrant.yaml</arguments>
+  <workingdirectory>C:/Tools/qdrant-service</workingdirectory>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <serviceaccount><domain>NT AUTHORITY</domain><user>LocalService</user></serviceaccount>
+  <logpath>C:/ProgramData/KnowledgeQdrant/logs</logpath>
+  <log mode="roll-by-size"><sizeThreshold>1024</sizeThreshold><keepFiles>3</keepFiles></log>
+  <stoptimeout>60sec</stoptimeout>
+  <onfailure action="restart" delay="10 sec"/>
+</service>
+```
+
+```yaml
+# qdrant.yaml: 위에서 초기화·복원·검증한 동일 저장소를 지정합니다.
+storage:
+  storage_path: C:/Users/YourName/qdrant-native
+  snapshots_path: C:/Users/YourName/qdrant-native/snapshots
+  temp_path: C:/Users/YourName/qdrant-native/tmp
+service:
+  host: 127.0.0.1
+  http_port: 6333
+  grpc_port: 6334
+telemetry_disabled: true
+log_level: WARN
+```
+
+LocalService 또는 별도의 제한된 계정에 실행 파일/설정은 읽기·실행, storage/snapshots/tmp/logs에는 수정 권한만 부여합니다. Vault 권한은 필요하지 않습니다. 예를 들어 관리자 셸에서 `icacls "C:/Tools/qdrant-service" /grant "*S-1-5-19:(OI)(CI)RX"`, `icacls "C:/Users/YourName/qdrant-native" /grant "*S-1-5-19:(OI)(CI)M"`을 적용하고 실행 파일 폴더/로그 폴더에도 각각 RX/M을 부여합니다. 상위 경로 통과 권한을 확인하고 LocalSystem 기본값에 맡기지 않습니다.
+
+기존 포트 사용 프로세스를 해당 절차에 따라 중지한 뒤 관리자 셸에서 등록합니다. 제거 시 데이터는 보존합니다.
+
+```powershell
+& 'C:/Tools/qdrant-service/QdrantService.exe' install
+& 'C:/Tools/qdrant-service/QdrantService.exe' start
+& 'C:/Tools/qdrant-service/QdrantService.exe' status
+# 복구/제거 후 위 Docker 롤백 명령을 적용합니다.
+& 'C:/Tools/qdrant-service/QdrantService.exe' stop
+& 'C:/Tools/qdrant-service/QdrantService.exe' uninstall
+```
+
 이 문서는 `obsidian-knowledge-mcp`의 백엔드 저장소인 Qdrant와 상태 추적 데이터베이스(`state.sqlite3`)의 동작 원리, 상태 키워드, REST API 진단 방법, 그리고 미완료 파일 추적 기법을 다룹니다.
 
 ---

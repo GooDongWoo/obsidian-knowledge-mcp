@@ -1,5 +1,6 @@
-"""Real localhost Qdrant tests; run the project's Compose service first."""
+"""Real localhost Qdrant tests; use KNOWLEDGE_TEST_QDRANT_URL for an owned server."""
 
+import os
 from dataclasses import replace
 from hashlib import sha256
 from uuid import uuid4
@@ -9,6 +10,9 @@ from qdrant_client import AsyncQdrantClient, models
 
 from knowledge_mcp.config import Settings
 from knowledge_mcp.documents import Chunk
+
+
+TEST_QDRANT_URL = os.environ.get("KNOWLEDGE_TEST_QDRANT_URL", Settings.DEFAULT_QDRANT_URL)
 
 
 @pytest.fixture
@@ -39,13 +43,22 @@ def chunk(path, text="프로젝트 알파", **changes):
     ), **changes)
 
 
-@pytest.fixture
-async def store(tmp_path):
+async def make_store(settings):
+    """Inject the test client without weakening production endpoint policy."""
     from knowledge_mcp.qdrant_store import KnowledgeStore
 
+    from unittest.mock import patch
+
+    with patch("knowledge_mcp.qdrant_store.AsyncQdrantClient",
+               lambda **kwargs: AsyncQdrantClient(url=TEST_QDRANT_URL, cloud_inference=True)):
+        return KnowledgeStore(settings, FakeEmbeddingProvider())
+
+
+@pytest.fixture
+async def store(tmp_path):
     settings = Settings(tmp_path, tmp_path / ".knowledge", Settings.DEFAULT_QDRANT_URL,
                         "knowledge_test_" + uuid4().hex, Settings.DEFAULT_DENSE_MODEL, "test")
-    instance = KnowledgeStore(settings, FakeEmbeddingProvider())
+    instance = await make_store(settings)
     try:
         await instance.ensure_schema()
         yield instance
@@ -58,7 +71,7 @@ async def store(tmp_path):
 async def test_server_accepts_multilingual_bm25_document():
     """Characterize server inference: no client-side tokenizer can mask failure."""
     name = "knowledge_bm25_probe_" + uuid4().hex
-    client = AsyncQdrantClient(url=Settings.DEFAULT_QDRANT_URL, cloud_inference=True)
+    client = AsyncQdrantClient(url=TEST_QDRANT_URL, cloud_inference=True)
     try:
         assert (await client.info()).version == "1.19.1"
         await client.create_collection(name, vectors_config={}, sparse_vectors_config={
@@ -100,15 +113,13 @@ async def test_schema_and_default_private_exclusion(store):
 
 @pytest.mark.anyio
 async def test_model_reads_selected_collection(tmp_path):
-    from knowledge_mcp.qdrant_store import KnowledgeStore
     from knowledge_mcp.retrieval import MultiModelStore
     from knowledge_mcp.search import SearchRequest
 
     name = "knowledge_bge_" + uuid4().hex
     model = "dragonkue/BGE-m3-ko"
-    store = KnowledgeStore(
+    store = await make_store(
         Settings(tmp_path, tmp_path / ".knowledge", Settings.DEFAULT_QDRANT_URL, name, model, "test"),
-        FakeEmbeddingProvider(),
     )
     router = MultiModelStore({model: store})
     try:

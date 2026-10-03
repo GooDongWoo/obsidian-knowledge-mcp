@@ -8,9 +8,8 @@ import pytest
 
 from knowledge_mcp.config import Settings
 from knowledge_mcp.documents import chunk_document, parse_source
-from knowledge_mcp.qdrant_store import KnowledgeStore
 from knowledge_mcp.state import Manifest, index_lock
-from test_qdrant_integration import FakeEmbeddingProvider
+from test_qdrant_integration import make_store
 
 
 @pytest.fixture
@@ -38,7 +37,7 @@ async def indexer(tmp_path):
     settings = Settings(root, tmp_path / "runtime", Settings.DEFAULT_QDRANT_URL,
                         "knowledge_indexer_test_" + uuid4().hex, Settings.DEFAULT_DENSE_MODEL, "test",
                         project_root=project)
-    store = KnowledgeStore(settings, FakeEmbeddingProvider())
+    store = await make_store(settings)
     instance = KnowledgeIndexer(settings, store, WordTokenizer())
     try:
         yield instance

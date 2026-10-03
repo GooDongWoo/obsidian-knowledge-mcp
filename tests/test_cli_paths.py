@@ -2,7 +2,6 @@ from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from knowledge_mcp.cli import ensure_qdrant
 
 
 def test_cli_accepts_full_rebuild():
@@ -180,35 +179,6 @@ def test_cli_import_keeps_ml_out_of_client_process():
          "assert not {'torch', 'onnxruntime', 'fastembed', 'sentence_transformers'} & sys.modules.keys()"],
         check=True, timeout=30,
     )
-from knowledge_mcp.config import Settings
-
-
-def test_launcher_uses_project_compose_and_project_runtime(tmp_path, monkeypatch):
-    vault = tmp_path / "vault"
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
-    settings = Settings.from_paths(vault_root=vault, project_root=project)
-    calls = []
-
-    def fake_run(*args, **kwargs):
-        calls.append((args, kwargs))
-
-    class Response:
-        status = 200
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return None
-
-    monkeypatch.setattr("knowledge_mcp.cli.subprocess.run", fake_run)
-    monkeypatch.setattr("knowledge_mcp.cli.urlopen", lambda *args, **kwargs: Response())
-    ensure_qdrant(settings, timeout_seconds=1)
-
-    assert str(project / "docker-compose.yml") in calls[0][0][0]
-    expected_storage = (project / ".knowledge" / "qdrant").resolve()
-    assert calls[0][1]["env"]["KNOWLEDGE_QDRANT_STORAGE"] == str(expected_storage).replace("\\", "/")
-    assert settings.qdrant_storage_dir.is_dir()
 
 
 def test_readme_contains_external_project_and_vault_paths():

@@ -13,7 +13,7 @@ A **local-first, privacy-preserving Model Context Protocol (MCP) server** design
 
 ### 1.1 Zero Cloud Leakage: Absolute Local Privacy
 Personal notes in Obsidian frequently contain private journals, research drafts, financial thoughts, or credentials. Relying on cloud-based vector databases or third-party embedding APIs introduces unavoidable privacy risks.
-- **100% On-Device**: Embeddings (`BGE-m3-ko`), cross-encoder re-ranking, and vector search (`Qdrant` on Docker) execute entirely on your local machine.
+- **100% On-Device**: Embeddings (`BGE-m3-ko`), cross-encoder re-ranking, and vector search (native `Qdrant` or an existing local service) execute entirely on your local machine.
 - **No External Telemetry**: No telemetry or query tracking leaves your computer.
 
 ### 1.2 Multi-Agent Resource Contention & System Freezing
@@ -29,9 +29,9 @@ To permanently solve these resource bottlenecks, the architecture was restructur
 3. **5-Layer Resource Guardrails**:
    - **CPU Thread Clamping**: PyTorch inference defaults to 4 threads, clamped to the available CPU count. This controls inference parallelism; CPU utilization can still spike.
    - **Batched Inferences**: SentenceTransformer embedding and cross-encoder reranking default to batch 8. Native model inference is serialized across providers, including the retained FastEmbed provider.
-   - **Chunked Qdrant Upserts**: Points are upserted in batches of 64 to stop WSL2 Docker (`vmmemWSL`) memory ballooning.
+   - **Chunked Qdrant Upserts**: Points are upserted in batches of 64 to bound each Qdrant request.
    - **File Size Ceiling**: Files over 30MB are automatically skipped to protect parser memory.
-   - **Container Memory Limit**: Qdrant container is capped at 4GB RAM via Docker Compose.
+   - **Docker Rollback Limit**: The optional Docker container retains its 4GB Compose limit; this limit does not apply to native Qdrant.
 
 The default BGE embedding and reranker use SentenceTransformer/PyTorch. Configure `KNOWLEDGE_EMBEDDING_BATCH_SIZE` and `KNOWLEDGE_RERANKER_BATCH_SIZE` (1–256), and `KNOWLEDGE_CPU_THREADS` (positive integer, clamped to the host CPU count). Batch 8 was selected from isolated cached-model CUDA measurements using synthetic inputs: compared with batch 32, embedding peak allocated memory fell by about 273 MiB and reranking by about 286 MiB, with nearly equal elapsed time for that sample. Batch 4 yielded smaller additional memory savings and slower processing. These measurements do not predict total system GPU memory or every workload's latency; see the [measurement record](docs/2026-10-01-qdrant-hardening-results.md).
 
@@ -81,7 +81,7 @@ The retained `LocalFastEmbedProvider` exposes separate ONNX controls: `KNOWLEDGE
    ├── bge-reranker-v2-m3-ko (CUDA/CPU Warmup)
    └── FastMCP Tools: qdrant-find, knowledge-index-status, knowledge-index-sync
          │
-         ├──> [ Local Docker Qdrant ] (Port 6333 / 6334)
+         ├──> [ Local Qdrant 1.19.1 ] (Port 6333 / 6334)
          │       └── Dense vectors, BM25 index, text chunks & payloads
          │
          └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
@@ -97,7 +97,7 @@ Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-
 
 ### 3.1 Prerequisites
 - **Python**: 3.11 or higher
-- **Docker Desktop**: Running with WSL2 backend (for Qdrant)
+- **Qdrant 1.19.1**: Official native executable; Docker Desktop is optional for rollback.
 - **NVIDIA GPU** (Recommended): CUDA 12.x compatible GPU for fast embedding inference (falls back to CPU if unavailable).
 
 ### 3.2 Setup Steps
@@ -159,11 +159,14 @@ FASTMCP_DEPRECATION_WARNINGS=true
 No global OpenTelemetry exporter is configured by this project. SDK tracing dependencies alone do not imply remote export; embedding and search remain local.
 
 ### 4.2 Initial Indexing
-Ensure Docker Desktop is running, then execute the initial index:
+Configure the official Qdrant 1.19.1 executable, then execute the initial index:
 ```powershell
+$env:KNOWLEDGE_QDRANT_EXECUTABLE = "C:/Tools/qdrant-1.19.1/qdrant.exe"
 .\.venv\Scripts\knowledge-mcp.exe index
 ```
-- This automatically starts the Qdrant container if it is not already running.
+- A healthy localhost Qdrant is reused. Otherwise the launcher starts the configured native executable (or `qdrant` on PATH), bound to 127.0.0.1. Services should use the absolute executable path.
+- Native data defaults to `%USERPROFILE%/.knowledge-qdrant/<project-path-hash>`; set `KNOWLEDGE_QDRANT_NATIVE_STORAGE` to a short absolute path if needed. Existing nonempty directories without the native ownership marker are refused.
+- Existing Docker data remains under `KNOWLEDGE_QDRANT_STORAGE` (default `.knowledge/qdrant`). Select `KNOWLEDGE_QDRANT_BACKEND=docker` explicitly for rollback. An existing installation needs a snapshot restore into new native storage before cutover; see the [migration and optional Windows service procedure](docs/qdrant-status-and-diagnostics.md#native-qdrant-migration).
 - The first run downloads the embedding model and builds the initial index. Subsequent runs are fully incremental.
 
 ### 4.3 Background Daemon Management

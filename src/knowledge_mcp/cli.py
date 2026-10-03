@@ -4,13 +4,10 @@ import argparse
 import asyncio
 from dataclasses import asdict, replace
 import os
-from pathlib import Path
-import subprocess
 import sys
-import time
-from urllib.request import urlopen
 
 from .config import Settings, _load_env_file
+from .qdrant_process import ensure_qdrant
 
 # FastMCP reads its settings during import, before main() is entered.
 _load_env_file()
@@ -64,36 +61,6 @@ def _dependencies(settings: Settings):
             manifest=Manifest(settings.runtime_dir, selected.collection_name), operation_log=log,
         )
     return MultiModelStore(stores, LocalReranker(settings=settings)), log, indexers
-
-
-def ensure_qdrant(settings: Settings, *, timeout_seconds: int = 60) -> None:
-    project_dir = settings.project_root
-    compose = project_dir / "docker-compose.yml"
-    settings.qdrant_storage_dir.mkdir(parents=True, exist_ok=True)
-    environment = os.environ.copy()
-    environment["KNOWLEDGE_QDRANT_STORAGE"] = str(settings.qdrant_storage_dir.resolve()).replace("\\", "/")
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    subprocess.run(
-        ["docker", "compose", "-f", str(compose), "up", "-d"],
-        cwd=project_dir,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=environment,
-        creationflags=creationflags,
-    )
-    deadline = time.monotonic() + timeout_seconds
-    last_error = "not ready"
-    while time.monotonic() < deadline:
-        try:
-            with urlopen(f"{settings.qdrant_url}/healthz", timeout=3) as response:
-                if response.status < 400:
-                    return
-        except Exception as exc:
-            last_error = str(exc)
-        time.sleep(1)
-    raise RuntimeError(f"Qdrant did not become healthy: {last_error}")
 
 
 def _parser() -> argparse.ArgumentParser:
