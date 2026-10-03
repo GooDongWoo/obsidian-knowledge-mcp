@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian Knowledge Query"
+  short_description: "Search prior Vault knowledge with source verification"
+  default_prompt: "Use $querying-obsidian-knowledge to find relevant prior Vault notes and verify the original sources."
