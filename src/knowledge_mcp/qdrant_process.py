@@ -29,7 +29,7 @@ def prepare_native_storage(storage: Path) -> None:
             pass
         raise RuntimeError("Invalid native Qdrant storage ownership marker; restore a verified snapshot into new storage")
     if any(storage.iterdir()):
-        raise RuntimeError("Unknown nonempty Qdrant storage: use new empty native storage and restore a snapshot; never adopt Docker data")
+        raise RuntimeError("Unknown nonempty Qdrant storage: use new empty native storage and restore a snapshot; never adopt unmanaged data")
     with marker.open("x", encoding="utf-8") as stream:
         json.dump(_OWNER, stream)
         stream.flush()
@@ -89,20 +89,7 @@ def ensure_qdrant(settings: Settings, *, timeout_seconds: int = 60) -> None:
     with index_lock(settings.runtime_dir, lock_name="qdrant-start.lock"):
         if _healthy(settings.qdrant_url):
             return
-        process, log_path = None, None
-        if settings.qdrant_backend == "docker":
-            storage = settings.docker_qdrant_storage_dir
-            storage.mkdir(parents=True, exist_ok=True)
-            environment = os.environ.copy()
-            environment["KNOWLEDGE_QDRANT_STORAGE"] = storage.as_posix()
-            subprocess.run(
-                ["docker", "compose", "-f", str(settings.project_root / "docker-compose.yml"), "up", "-d"],
-                cwd=settings.project_root, check=True, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=environment,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        else:
-            process, log_path = _start_native(settings)
+        process, log_path = _start_native(settings)
         deadline = time.monotonic() + timeout_seconds
         ready = False
         try:
@@ -113,7 +100,7 @@ def ensure_qdrant(settings: Settings, *, timeout_seconds: int = 60) -> None:
                     ready = True
                     return
                 time.sleep(0.1)
-            raise RuntimeError(f"Qdrant did not become healthy; inspect log {log_path or 'docker compose logs qdrant'}. Use a short absolute native storage path on Windows.")
+            raise RuntimeError(f"Qdrant did not become healthy; inspect log {log_path}. Use a short absolute native storage path on Windows.")
         finally:
             # Only reap a child this call created, and only after failed startup.
             if process is not None and not ready:
