@@ -7,7 +7,7 @@
 
 [공식 v1.19.1 Windows 릴리스](https://github.com/qdrant/qdrant/releases/tag/v1.19.1)의 `qdrant-x86_64-pc-windows-msvc.zip`을 사용합니다. 검증된 archive SHA-256은 `9b6f69bd85f6abed4bc13f943099f55c6ffd55f5dd90388635320d8fbb569eb0`입니다. `Get-FileHash -Algorithm SHA256 <archive>`로 확인하고 도구 폴더에 압축을 풉니다.
 
-`KNOWLEDGE_QDRANT_EXECUTABLE`에는 실행 파일의 절대 경로를 지정합니다. PATH 조회도 지원하지만 무인 실행에는 절대 경로를 권장합니다. `KNOWLEDGE_QDRANT_BACKEND=native`가 기본값이며, localhost health가 정상이면 backend 설정과 관계없이 기존 서버를 재사용합니다. 일반 CLI 실행에는 서비스 등록이 필요하지 않습니다.
+`KNOWLEDGE_QDRANT_EXECUTABLE`에는 실행 파일의 절대 경로를 지정합니다. PATH 조회도 지원하지만 무인 실행에는 절대 경로를 권장합니다. localhost health가 정상이면 기존 서버를 자동으로 재사용합니다. 일반 CLI 실행에는 서비스 등록이 필요하지 않습니다.
 
 `KNOWLEDGE_QDRANT_NATIVE_STORAGE`는 새 네이티브 저장소의 절대 경로입니다. 생략하면 사용자 홈의 `.knowledge-qdrant/<프로젝트 경로 SHA-256 앞 12자리>`를 사용합니다. Windows의 깊은 checkout/임시 폴더 아래에서는 Gridstore가 긴 경로 오류를 낼 수 있으므로 짧은 경로를 사용하세요. 런처는 빈 저장소에만 `.knowledge-native-owner.json`을 만들고 재시작 시 확인합니다. 표식 없는 nonempty 저장소는 거부합니다. Docker 폴더를 이름 변경하거나 표식을 직접 만들어 우회하지 마세요.
 
@@ -87,20 +87,11 @@ python -m pytest tests/test_qdrant_integration.py -q
 
 1. MCP와 모든 writer를 중지하고 최종 백업 쌍을 보존합니다. 원본 checkout/runtime/환경은 그대로 두고 새 runtime은 백업 SQLite의 복사본을 사용합니다.
 2. 검증한 방법으로 최종 데이터를 새 네이티브 저장소에 복원하고 비교를 다시 통과시킵니다. 오래된 리허설 백업으로 바로 전환하지 않습니다.
-3. 리허설 프로세스를 종료하고 원래 Compose의 `stop qdrant`로 원본 컨테이너만 중지합니다. `down -v`나 WSL 전체 종료를 사용하지 않습니다.
+3. 리허설 프로세스를 종료하고 기존 서비스가 실행 중이라면 중지합니다.
 4. 새 checkout 환경에 executable/native storage를 명시하고 네이티브 6333/6334, MCP 8765를 시작합니다. 일반 런처라면 실행 파일/저장소를 확인한 해당 PID만 관리합니다.
 5. health, count, 검색/rerank, modern/legacy 도구 목록, 색인 상태를 재확인합니다. `vmmemWSL`, 전체 프로세스 RSS, native RSS, 기동/증분 색인 시간을 같은 조건에서 비교합니다. 다른 WSL 작업의 메모리까지 제거됐다고 해석하지 않습니다.
 
-복원/동작 검증 실패 또는 자원 이득이 확인되지 않으면 새 MCP/네이티브를 중지하고 원래 checkout·환경·runtime으로 복구합니다. 전환 후 변경분이 있다면 양쪽 백업을 먼저 보존하고 재동기화 범위를 결정합니다. 다른 시점의 SQLite와 Qdrant를 임의로 섞지 않습니다.
-
-```powershell
-$env:KNOWLEDGE_QDRANT_BACKEND = "docker"
-$env:KNOWLEDGE_QDRANT_STORAGE = "C:/Path/To/original-project/.knowledge/qdrant"
-docker compose -f "C:/Path/To/original-project/docker-compose.yml" up -d
-# 원래 checkout/가상환경/설정으로 MCP를 재시작하고 검증합니다.
-```
-
-Compose와 원본 저장소 정리는 롤백 보존 기간 후 별도로 결정합니다.
+복원/동작 검증 실패 시 새 MCP/네이티브 프로세스를 중지하고, 백업본을 새로운 클린 네이티브 저장소에 직접 복원하여 복구합니다. 전환 후 변경분이 있다면 양쪽 백업을 먼저 보존하고 재동기화 범위를 결정합니다. 다른 시점의 SQLite와 Qdrant를 임의로 섞지 않습니다.
 
 ### 선택적 Windows 자동 시작 서비스
 
@@ -145,7 +136,7 @@ LocalService 또는 별도의 제한된 계정에 실행 파일/설정은 읽기
 & 'C:/Tools/qdrant-service/QdrantService.exe' install
 & 'C:/Tools/qdrant-service/QdrantService.exe' start
 & 'C:/Tools/qdrant-service/QdrantService.exe' status
-# 복구/제거 후 위 Docker 롤백 명령을 적용합니다.
+# 복구/제거 후 수동 프로세스로 전환하거나 백업을 복원합니다.
 & 'C:/Tools/qdrant-service/QdrantService.exe' stop
 & 'C:/Tools/qdrant-service/QdrantService.exe' uninstall
 ```

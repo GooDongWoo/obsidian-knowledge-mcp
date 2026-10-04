@@ -83,7 +83,7 @@ def _start_native(settings: Settings):
 
 
 def ensure_qdrant(settings: Settings, *, timeout_seconds: int = 60) -> None:
-    """Reuse healthy services, otherwise start the explicitly selected backend."""
+    """Reuse healthy services, otherwise start the local native Qdrant process."""
     if _healthy(settings.qdrant_url):
         return
     with index_lock(settings.runtime_dir, lock_name="qdrant-start.lock"):
