@@ -33,7 +33,7 @@
 - **경량 Stdio protocol 프록시**: AI 에이전트(Codex 등)의 진입점으로, 무거운 ML 라이브러리를 로드하지 않습니다. 공식 FastMCP 프록시가 클라이언트의 protocol era를 그대로 반영하여 modern→modern, legacy→legacy로 연결합니다. 최신 `server/discover` 요청을 강제로 거절하거나 legacy로 강등시키지 않습니다.
 - **로컬 보안 원칙**: 외부 Qdrant Cloud나 상용 임베딩 API를 사용하지 않으며, 모든 임베딩과 검색은 PC 내부에서 처리됩니다.
 
-Streamable HTTP는 `/mcp` 하나에서 POST 요청과 JSON 또는 **요청별 SSE 응답**을 처리합니다. 이 SSE는 구 HTTP+SSE 전송의 지속 `/sse` 연결 및 별도 message endpoint와 다릅니다. MCP `2026-07-28` modern 요청은 discovery와 요청별 protocol metadata를 사용하며 `initialize`, protocol session ID, 별도 GET stream을 요구하지 않습니다. daemon 직접 HTTP, 기본 stdio proxy, standalone stdio 모두 최신 protocol을 지원하고, 구 클라이언트는 SDK의 정상 initialize 기반 협상으로 같은 `/mcp` 데몬을 이용합니다.
+Streamable HTTP는 `/mcp` 하나에서 POST 요청과 JSON 또는 **요청별 SSE 응답**을 처리합니다. 이 SSE는 구 HTTP+SSE 전송의 지속 `/sse` 연결 및 별도 message endpoint와 다릅니다. MCP `2026-07-28` modern 요청은 discovery와 요청별 protocol metadata를 사용하며 `initialize`, protocol session ID, 별도 GET stream을 요구하지 않습니다. daemon 직접 HTTP 및 stdio proxy 모두 최신 protocol을 지원하고, 구 클라이언트는 SDK의 정상 initialize 기반 협상으로 같은 `/mcp` 데몬을 이용합니다.
 
 ---
 
@@ -171,7 +171,6 @@ MCP endpoint는 `http://127.0.0.1:8765/mcp`, 프로세스 health endpoint는 `ht
 & $mcp serve --client codex
 ```
 - 기본적으로 **백그라운드 데몬이 켜져 있는지 확인하고, 없으면 자동 기동한 후 Stdio 프록시로 연결**됩니다.
-- `--standalone` 플래그를 주면 데몬 없이 단독 stdio 프로세스로 실행할 수 있으며 MCP `2026-07-28`과 legacy 협상을 지원합니다. 이 경로는 자체 모델을 로드하므로 여러 클라이언트가 모델을 공유하려면 기본 `serve`를 사용하세요. standalone은 읽기 도구 `qdrant-find`, `knowledge-index-status` 두 개를 제공합니다.
 
 ---
 
@@ -268,7 +267,7 @@ HTTP/MCP는 Qdrant 확인, 모델 로딩, 최초 증분 동기화, 리랭커 war
 
 실제 색인 중에는 `qdrant-find`만 명시적인 “인덱싱 중, 잠시 후 재시도” 도구 오류를 반환합니다. 모델 준비 전에는 starting 또는 초기화 실패로 구분합니다. 색인이 끝나면 최근 동기화가 일부 실패했더라도 유효한 기존 컬렉션을 검색할 수 있습니다. Qdrant 연결 실패는 검색 오류로 반환되며 indexing으로 표시하지 않습니다. 선택적 warmup 실패는 `warmup_error`로 표시하고 기본 검색은 허용합니다.
 
-초기·수동 동기화는 하나의 writer 대기열을 공유합니다. 정상 종료 시 관리 작업을 취소하고, 이미 시작된 파일·SQLite·모델 스레드 작업을 완료한 뒤 중단 상태를 기록하고 Qdrant 클라이언트를 사용하던 이벤트 루프에서 닫습니다. 실행 중인 네이티브 모델 작업 때문에 정상 종료가 늦어질 수 있습니다. `serve --standalone`도 같은 초기화 수명주기를 사용하며 읽기 도구 두 개를 유지합니다.
+초기·수동 동기화는 하나의 writer 대기열을 공유합니다. 정상 종료 시 관리 작업을 취소하고, 이미 시작된 파일·SQLite·모델 스레드 작업을 완료한 뒤 중단 상태를 기록하고 Qdrant 클라이언트를 사용하던 이벤트 루프에서 닫습니다. 실행 중인 네이티브 모델 작업 때문에 정상 종료가 늦어질 수 있습니다.
 
 `KNOWLEDGE_DAEMON_START_TIMEOUT`의 기본 900초는 HTTP 서버가 열릴 때까지 기다리는 제한입니다. 모델·색인 준비 상태 및 일반 도구 호출 제한 15초와는 별개입니다.
 

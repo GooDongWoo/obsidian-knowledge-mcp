@@ -89,7 +89,7 @@ The retained `LocalFastEmbedProvider` exposes separate ONNX controls: `KNOWLEDGE
 ```
 </details>
 
-Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-scoped SSE responses. Those SSE responses are distinct from the retired HTTP+SSE transport's persistent `/sse` connection and separate message endpoint. Modern requests use discovery and per-request protocol metadata without requiring `initialize`, a protocol session ID, or a separate GET stream. Direct HTTP, the default stdio proxy, and `serve --standalone` support MCP `2026-07-28`; standalone loads its own models and exposes the two read tools (`qdrant-find`, `knowledge-index-status`).
+Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-scoped SSE responses. Those SSE responses are distinct from the retired HTTP+SSE transport's persistent `/sse` connection and separate message endpoint. Modern requests use discovery and per-request protocol metadata without requiring `initialize`, a protocol session ID, or a separate GET stream. Direct HTTP and the default stdio proxy support MCP `2026-07-28`.
 
 ---
 
@@ -269,7 +269,7 @@ Status includes the actual reranker `device` (`cuda`, `cpu`, or `null` before su
 
 During active indexing, `qdrant-find` returns an explicit indexing/retry tool error. Before models exist it reports starting or initialization failure. Once indexing stops, searches can use a valid existing collection even if the latest sync was partial; Qdrant connection errors are reported as search errors. Optional warmup failure is reported as `warmup_error` and leaves base retrieval available. Initial and manual sync share one writer queue. Shutdown cancels managed work, finishes any already-running file/SQLite/model thread operation, records interrupted sync, and closes Qdrant clients on their owning event loop. A native model operation already in progress can delay graceful shutdown.
 
-`KNOWLEDGE_DAEMON_START_TIMEOUT` (default 900 seconds) now bounds waiting for the HTTP listener, independently of model/index readiness. The proxy's normal tool-call deadline remains 15 seconds. `serve --standalone` uses the same managed initialization lifecycle while preserving its two read tools.
+`KNOWLEDGE_DAEMON_START_TIMEOUT` (default 900 seconds) now bounds waiting for the HTTP listener, independently of model/index readiness. The proxy's normal tool-call deadline remains 15 seconds.
 
 ---
 
