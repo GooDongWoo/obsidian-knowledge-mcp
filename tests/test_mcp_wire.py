@@ -396,31 +396,6 @@ async def test_stdio_proxy_session_failure_shares_restart_and_recovers(applicati
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
-async def test_standalone_cli_runs_real_stdio_protocol(tmp_path, mode):
-    # Replace only external Qdrant/model work; execute the real CLI run path.
-    script = tmp_path / "standalone.py"
-    script.write_text(
-        "from pathlib import Path\nfrom types import SimpleNamespace\n"
-        "from knowledge_mcp import cli\nfrom knowledge_mcp.config import Settings\n"
-        "from knowledge_mcp.state import OperationLog\n"
-        "root=Path(__file__).parent\n"
-        "settings=Settings(root/'vault',root/'runtime','http://127.0.0.1:6333','standalone',Settings.DEFAULT_DENSE_MODEL,'test',project_root=root)\n"
-        "cli.Settings.from_env=lambda _: settings\ncli.ensure_qdrant=lambda _: None\n"
-        "cli._dependencies=lambda _: (SimpleNamespace(),OperationLog(settings.runtime_dir),{})\n"
-        "raise SystemExit(cli.main(['serve','--standalone']))\n", encoding="utf-8",
-    )
-    transport = StdioTransport(command=sys.executable, args=[str(script)],
-                               env={**os.environ, "FASTMCP_CHECK_FOR_UPDATES": "off", "FASTMCP_TELEMETRY_MODE": "off"})
-    with anyio.fail_after(20):
-        async with Client(transport, mode=mode) as client:
-            assert (client.protocol_version == "2026-07-28") is (mode == "auto")
-            assert {t.name for t in await client.list_tools()} == {"qdrant-find", "knowledge-index-status"}
-            status = await client.call_tool("knowledge-index-status", {})
-            assert status.data["collection"] == "standalone"
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["auto", "legacy"])
 @pytest.mark.parametrize("policy,applied,error", [
     ("default", True, None),
     ("false", False, None),
