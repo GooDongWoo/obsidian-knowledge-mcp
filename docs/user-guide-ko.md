@@ -28,12 +28,12 @@
                  └── 파일별 완료 기록, 인덱스 실행 로그, 질의 통계
 ```
 
-- **로컬 Qdrant**: 기본적으로 Windows 네이티브 1.19.1을 사용합니다. 정상 실행 중인 로컬 서비스도 재사용하며 Docker 구성은 롤백용으로 보존합니다.
+- **로컬 Qdrant**: Windows 네이티브 1.19.1 바이너리를 사용합니다. 정상 실행 중인 로컬 서비스(127.0.0.1:6333)도 자동으로 감지하여 재사용합니다.
 - **단일 HTTP 데몬**: FastMCP `4.0.10`과 MCP SDK `2.2.0`을 사용하며, 무거운 딥러닝 모델(`BGE-m3-ko`, 리랭커)을 1벌만 메모리에 상주시킵니다.
 - **경량 Stdio protocol 프록시**: AI 에이전트(Codex 등)의 진입점으로, 무거운 ML 라이브러리를 로드하지 않습니다. 공식 FastMCP 프록시가 클라이언트의 protocol era를 그대로 반영하여 modern→modern, legacy→legacy로 연결합니다. 최신 `server/discover` 요청을 강제로 거절하거나 legacy로 강등시키지 않습니다.
 - **로컬 보안 원칙**: 외부 Qdrant Cloud나 상용 임베딩 API를 사용하지 않으며, 모든 임베딩과 검색은 PC 내부에서 처리됩니다.
 
-Streamable HTTP는 `/mcp` 하나에서 POST 요청과 JSON 또는 **요청별 SSE 응답**을 처리합니다. 이 SSE는 구 HTTP+SSE 전송의 지속 `/sse` 연결 및 별도 message endpoint와 다릅니다. MCP `2026-07-28` modern 요청은 discovery와 요청별 protocol metadata를 사용하며 `initialize`, protocol session ID, 별도 GET stream을 요구하지 않습니다. daemon 직접 HTTP, 기본 stdio proxy, standalone stdio 모두 최신 protocol을 지원하고, 구 클라이언트는 SDK의 정상 initialize 기반 협상으로 같은 `/mcp` 데몬을 이용합니다.
+Streamable HTTP는 `/mcp` 하나에서 POST 요청과 JSON 또는 **요청별 SSE 응답**을 처리합니다. 이 SSE는 구 HTTP+SSE 전송의 지속 `/sse` 연결 및 별도 message endpoint와 다릅니다. MCP `2026-07-28` modern 요청은 discovery와 요청별 protocol metadata를 사용하며 `initialize`, protocol session ID, 별도 GET stream을 요구하지 않습니다. daemon 직접 HTTP 및 stdio proxy 모두 최신 protocol을 지원하고, 구 클라이언트는 SDK의 정상 initialize 기반 협상으로 같은 `/mcp` 데몬을 이용합니다.
 
 ---
 
@@ -171,7 +171,6 @@ MCP endpoint는 `http://127.0.0.1:8765/mcp`, 프로세스 health endpoint는 `ht
 & $mcp serve --client codex
 ```
 - 기본적으로 **백그라운드 데몬이 켜져 있는지 확인하고, 없으면 자동 기동한 후 Stdio 프록시로 연결**됩니다.
-- `--standalone` 플래그를 주면 데몬 없이 단독 stdio 프로세스로 실행할 수 있으며 MCP `2026-07-28`과 legacy 협상을 지원합니다. 이 경로는 자체 모델을 로드하므로 여러 클라이언트가 모델을 공유하려면 기본 `serve`를 사용하세요. standalone은 읽기 도구 `qdrant-find`, `knowledge-index-status` 두 개를 제공합니다.
 
 ---
 
@@ -268,35 +267,24 @@ HTTP/MCP는 Qdrant 확인, 모델 로딩, 최초 증분 동기화, 리랭커 war
 
 실제 색인 중에는 `qdrant-find`만 명시적인 “인덱싱 중, 잠시 후 재시도” 도구 오류를 반환합니다. 모델 준비 전에는 starting 또는 초기화 실패로 구분합니다. 색인이 끝나면 최근 동기화가 일부 실패했더라도 유효한 기존 컬렉션을 검색할 수 있습니다. Qdrant 연결 실패는 검색 오류로 반환되며 indexing으로 표시하지 않습니다. 선택적 warmup 실패는 `warmup_error`로 표시하고 기본 검색은 허용합니다.
 
-초기·수동 동기화는 하나의 writer 대기열을 공유합니다. 정상 종료 시 관리 작업을 취소하고, 이미 시작된 파일·SQLite·모델 스레드 작업을 완료한 뒤 중단 상태를 기록하고 Qdrant 클라이언트를 사용하던 이벤트 루프에서 닫습니다. 실행 중인 네이티브 모델 작업 때문에 정상 종료가 늦어질 수 있습니다. `serve --standalone`도 같은 초기화 수명주기를 사용하며 읽기 도구 두 개를 유지합니다.
+초기·수동 동기화는 하나의 writer 대기열을 공유합니다. 정상 종료 시 관리 작업을 취소하고, 이미 시작된 파일·SQLite·모델 스레드 작업을 완료한 뒤 중단 상태를 기록하고 Qdrant 클라이언트를 사용하던 이벤트 루프에서 닫습니다. 실행 중인 네이티브 모델 작업 때문에 정상 종료가 늦어질 수 있습니다.
 
 `KNOWLEDGE_DAEMON_START_TIMEOUT`의 기본 900초는 HTTP 서버가 열릴 때까지 기다리는 제한입니다. 모델·색인 준비 상태 및 일반 도구 호출 제한 15초와는 별개입니다.
 
 ---
 
-## 6. 네이티브 Qdrant와 Docker 롤백
+## 6. 네이티브 Qdrant 운영 및 스토리지
 
-일반 실행에는 서비스 설치가 필요하지 않습니다. 공식 Qdrant 1.19.1 바이너리의 절대 경로를 지정하세요. PATH는 수동 CLI 편의용이며 무인 실행에는 절대 경로를 권장합니다.
+일반 실행에는 서비스 설치가 필요하지 않습니다. Qdrant는 로컬 네이티브 프로세스로 실행되며, 공식 Qdrant 1.19.1 바이너리의 절대 경로를 지정하세요. PATH는 수동 CLI 편의용이며 무인 실행에는 절대 경로를 권장합니다.
 
 ```powershell
 $env:KNOWLEDGE_QDRANT_EXECUTABLE = "C:/Tools/qdrant-1.19.1/qdrant.exe"
 $env:KNOWLEDGE_QDRANT_NATIVE_STORAGE = "C:/Users/YourName/qdrant-native"
-$env:KNOWLEDGE_QDRANT_BACKEND = "native"
 ```
 
-네이티브 기본 저장소는 사용자 홈의 `.knowledge-qdrant/<프로젝트 경로 해시>`입니다. 짧은 경로는 Windows Gridstore의 긴 경로 실패를 피합니다. 빈 폴더에만 `.knowledge-native-owner.json`을 생성하며, 표식 없는 기존 데이터는 snapshot 이행 안내와 함께 거부합니다. Docker 데이터 폴더를 지정하거나 표식을 직접 만들어 우회하지 마세요. 정상 응답하는 localhost 서버는 backend 설정과 무관하게 우선 재사용합니다. Qdrant 6333/6334와 MCP 8765 기본 포트는 유지됩니다.
+네이티브 기본 저장소는 사용자 홈의 `%USERPROFILE%/.knowledge-qdrant/<프로젝트 경로 해시>`입니다. 짧은 경로는 Windows Gridstore의 긴 경로 실패를 방지합니다. 빈 폴더에만 `.knowledge-native-owner.json`을 생성하며, 표식 없는 임의의 기존 데이터 폴더는 거부합니다. 기본 경로 외에 별도 디렉터리를 사용하려면 `KNOWLEDGE_QDRANT_NATIVE_STORAGE` 환경 변수를 지정하세요. 정상 응답하는 localhost Qdrant 인스턴스(127.0.0.1:6333)가 이미 실행 중이면 자동으로 감지하여 우선 재사용합니다. Qdrant 6333/6334와 MCP 8765 기본 포트는 유지됩니다.
 
-[백업·snapshot 복원·검증·전환 및 선택적 서비스 등록](qdrant-status-and-diagnostics.md#native-qdrant-migration)을 먼저 따르세요. 아래 명령은 원본 Docker 저장소를 사용하는 명시적 롤백용입니다. 같은 포트의 네이티브 프로세스를 먼저 종료한 뒤 실행합니다:
-
-```powershell
-# 컨테이너 상태 확인
-docker ps --filter "name=obsidian-knowledge-mcp-qdrant-1"
-
-# Docker Compose 수동 기동
-$env:KNOWLEDGE_QDRANT_BACKEND = "docker"
-$env:KNOWLEDGE_QDRANT_STORAGE = (Join-Path $project '.knowledge\qdrant').Replace('\', '/')
-docker compose -f (Join-Path $project 'docker-compose.yml') up -d
-```
+데이터 백업, snapshot 복원, 검증 및 선택적 서비스 등록에 대한 자세한 내용은 [Qdrant 상태 진단 및 색인 모니터링 가이드](qdrant-status-and-diagnostics.md#native-qdrant-migration)를 참조하세요. 복원이나 롤백이 필요한 경우 백업 데이터를 새로운 네이티브 저장소에 직접 복원합니다.
 
 ---
 

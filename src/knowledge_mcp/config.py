@@ -63,25 +63,19 @@ class Settings:
     onnx_arena_extend_strategy: str = "kSameAsRequested"
     onnx_intra_op_num_threads: int = 4
 
-    qdrant_backend: str = "native"
     qdrant_executable: str | None = None
     qdrant_native_storage: Path | None = None
-    qdrant_docker_storage: Path | None = None
 
     def __post_init__(self) -> None:
         if self.project_root is None:
             object.__setattr__(self, "project_root", self.vault_root / "00_System" / "knowledge-mcp")
         if self.project_root.resolve() == self.vault_root.resolve():
             raise ValueError("project_root must be outside the Vault root")
-        if self.qdrant_backend not in ("native", "docker"):
-            raise ValueError("qdrant_backend must be native or docker")
-        for name in ("qdrant_native_storage", "qdrant_docker_storage"):
-            value = getattr(self, name)
-            if value is not None:
-                value = Path(value).expanduser()
-                if not value.is_absolute():
-                    raise ValueError(f"{name} must be an absolute path")
-                object.__setattr__(self, name, value.resolve())
+        if self.qdrant_native_storage is not None:
+            value = Path(self.qdrant_native_storage).expanduser()
+            if not value.is_absolute():
+                raise ValueError("qdrant_native_storage must be an absolute path")
+            object.__setattr__(self, "qdrant_native_storage", value.resolve())
         for name in ("embedding_batch_size", "reranker_batch_size", "cpu_threads", "onnx_intra_op_num_threads"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -111,10 +105,6 @@ class Settings:
         # Short paths avoid Windows Gridstore failures under deep checkouts.
         identity = os.path.normcase(str(self.project_root.resolve()))
         return Path.home() / ".knowledge-qdrant" / sha256(identity.encode()).hexdigest()[:12]
-
-    @property
-    def docker_qdrant_storage_dir(self) -> Path:
-        return self.qdrant_docker_storage or (self.runtime_dir / "qdrant").resolve()
 
     @classmethod
     def from_paths(cls, *, vault_root: Path, project_root: Path) -> "Settings":
@@ -155,12 +145,9 @@ class Settings:
             dense_model=dense_model,
             client_name=client_name,
             project_root=project_root,
-            qdrant_backend=os.environ.get("KNOWLEDGE_QDRANT_BACKEND", "native"),
             qdrant_executable=os.environ.get("KNOWLEDGE_QDRANT_EXECUTABLE") or None,
             qdrant_native_storage=Path(os.environ["KNOWLEDGE_QDRANT_NATIVE_STORAGE"])
                 if os.environ.get("KNOWLEDGE_QDRANT_NATIVE_STORAGE") else None,
-            qdrant_docker_storage=Path(os.environ["KNOWLEDGE_QDRANT_STORAGE"])
-                if os.environ.get("KNOWLEDGE_QDRANT_STORAGE") else None,
             embedding_batch_size=int(os.environ.get("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "8")),
             reranker_batch_size=int(os.environ.get("KNOWLEDGE_RERANKER_BATCH_SIZE", "8")),
             cpu_threads=int(os.environ.get("KNOWLEDGE_CPU_THREADS", "4")),

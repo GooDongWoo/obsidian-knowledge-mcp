@@ -13,7 +13,6 @@ from .qdrant_process import ensure_qdrant
 _load_env_file()
 
 from .daemon import (
-    create_daemon_application,
     get_daemon_pid,
     is_daemon_running,
     run_daemon,
@@ -68,9 +67,8 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     # serve command
-    serve_parser = subparsers.add_parser("serve", help="Run MCP stdio proxy or standalone server")
+    serve_parser = subparsers.add_parser("serve", help="Run MCP stdio proxy")
     serve_parser.add_argument("--client", choices=("codex", "claude-code", "antigravity"), default="codex")
-    serve_parser.add_argument("--standalone", action="store_true", help="Run in-process stdio server without daemon")
     serve_parser.add_argument("--host", default=DEFAULT_DAEMON_HOST, help="Daemon host")
     serve_parser.add_argument("--port", type=int, default=DEFAULT_DAEMON_PORT, help="Daemon port")
 
@@ -135,19 +133,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
         if command == "serve":
-            if getattr(args, "standalone", False):
-                application = create_daemon_application(settings, sync_tool=False)
-                application.mcp.run(transport="stdio")
-                return 0
-            else:
-                # Default mode: Ensure daemon is running and proxy stdio
-                if not is_daemon_running(port=port, host=host):
-                    start_daemon_process(settings, port=port, host=host)
-                import anyio
-                from .proxy import run_stdio_proxy
+            if not is_daemon_running(port=port, host=host):
+                start_daemon_process(settings, port=port, host=host)
+            import anyio
+            from .proxy import run_stdio_proxy
 
-                anyio.run(run_stdio_proxy, f"http://{host}:{port}/mcp", settings)
-                return 0
+            anyio.run(run_stdio_proxy, f"http://{host}:{port}/mcp", settings)
+            return 0
 
         # index and rebuild
         ensure_qdrant(settings)

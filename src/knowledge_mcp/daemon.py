@@ -432,17 +432,16 @@ class _DaemonRuntime:
                         await client.close()
 
 
-def create_daemon_application(settings: Settings, *, sync_tool: bool = True):
+def create_daemon_application(settings: Settings):
     """Register tools/health without touching Qdrant, models or the state DB."""
     runtime = _DaemonRuntime(settings)
     application = create_application(settings, lifespan=runtime.lifespan)
     runtime.application = application
     application.runtime_status = runtime.status
 
-    if sync_tool:
-        @application.mcp.tool(name="knowledge-index-sync", description="Trigger synchronization of the local Vault index.")
-        async def knowledge_index_sync(rebuild: bool = False, force_full_hash: bool = False) -> dict[str, Any]:
-            return await runtime.sync(rebuild=rebuild, force_full_hash=force_full_hash)
+    @application.mcp.tool(name="knowledge-index-sync", description="Trigger synchronization of the local Vault index.")
+    async def knowledge_index_sync(rebuild: bool = False, force_full_hash: bool = False) -> dict[str, Any]:
+        return await runtime.sync(rebuild=rebuild, force_full_hash=force_full_hash)
 
     @application.mcp.custom_route("/health", methods=["GET"])
     async def health(request):
