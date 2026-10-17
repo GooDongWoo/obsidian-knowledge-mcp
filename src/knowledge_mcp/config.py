@@ -46,7 +46,7 @@ def _load_env_file(project_dir: Path | None = None) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    DEFAULT_QDRANT_URL = "http://127.0.0.1:6333"
+    DEFAULT_QDRANT_URL = "http://127.0.0.1:26333"
     DEFAULT_DENSE_MODEL = DENSE_MODELS[0]
     vault_root: Path
     runtime_dir: Path
@@ -132,6 +132,8 @@ class Settings:
         vault_root = Path(raw_vault).expanduser().resolve()
         project_root = Path(os.environ.get("KNOWLEDGE_PROJECT_ROOT", package_project)).expanduser().resolve()
         qdrant_url = os.environ.get("KNOWLEDGE_QDRANT_URL", cls.DEFAULT_QDRANT_URL)
+        if qdrant_url == "http://127.0.0.1:6333":
+            qdrant_url = cls.DEFAULT_QDRANT_URL
         if qdrant_url != cls.DEFAULT_QDRANT_URL:
             raise ValueError("KNOWLEDGE_QDRANT_URL must be the local Qdrant URL")
         dense_model = os.environ.get("KNOWLEDGE_DENSE_MODEL", cls.DEFAULT_DENSE_MODEL)

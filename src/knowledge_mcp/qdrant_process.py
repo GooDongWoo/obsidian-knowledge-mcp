@@ -51,7 +51,7 @@ def _start_native(settings: Settings):
     endpoint = urlsplit(settings.qdrant_url)
     if endpoint.scheme != "http" or endpoint.hostname not in ("localhost", "127.0.0.1"):
         raise ValueError("Native Qdrant automatic start requires a local HTTP endpoint")
-    port = endpoint.port or 6333
+    port = endpoint.port or 26333
     storage = settings.qdrant_storage_dir.resolve()
     prepare_native_storage(storage)
     config = storage / ".knowledge-native.yaml"
