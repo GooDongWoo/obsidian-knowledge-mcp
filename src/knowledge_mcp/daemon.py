@@ -179,6 +179,7 @@ def _start_daemon_locked(settings: Settings, port: int, host: str, timeout: floa
     env["KNOWLEDGE_PROJECT_ROOT"] = str(settings.project_root)
     env["KNOWLEDGE_COLLECTION"] = settings.collection_name
     env["KNOWLEDGE_DENSE_MODEL"] = settings.dense_model
+    env["KNOWLEDGE_INFERENCE_PRECISION"] = settings.inference_precision
     env["KNOWLEDGE_DAEMON_BACKGROUND"] = "1"
 
     popen_kwargs: dict[str, Any] = {}

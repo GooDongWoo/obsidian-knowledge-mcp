@@ -42,7 +42,7 @@ def model_settings(settings: Settings) -> dict[str, Settings]:
 
 
 def _dependencies(settings: Settings):
-    from .embeddings import create_embedding_provider
+    from .embeddings import LocalSentenceTransformerProvider, create_embedding_provider
     from .indexer import KnowledgeIndexer
     from .qdrant_store import KnowledgeStore
     from .retrieval import MultiModelStore
@@ -55,8 +55,12 @@ def _dependencies(settings: Settings):
         provider = create_embedding_provider(model, settings=selected)
         store = KnowledgeStore(selected, provider)
         stores[model] = store
+        tokenizer = provider.get_tokenizer()
+        precision = getattr(provider, "effective_dtype", None)
+        if isinstance(provider, LocalSentenceTransformerProvider) and precision not in {"float32", "bfloat16"}:
+            raise RuntimeError("Embedding precision must be resolved before indexer construction")
         indexers[model] = KnowledgeIndexer(
-            selected, store, provider.get_tokenizer(),
+            selected, store, tokenizer, embedding_precision=precision,
             manifest=Manifest(settings.runtime_dir, selected.collection_name), operation_log=log,
         )
     return MultiModelStore(stores, LocalReranker(settings=settings)), log, indexers

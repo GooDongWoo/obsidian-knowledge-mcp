@@ -90,11 +90,34 @@ class KnowledgeApplication:
                 "collection": self.settings.collection_name, "dense_model": self.settings.dense_model,
                 **self.index_snapshot,
                 **self.runtime_status,
+                **self.embedding_status(),
                 **self.reranker_status(),
                 "progress": {model: dict(getattr(indexer, "progress", {}))
                              for model, indexer in self.indexers.items()},
             }
         return await self.read_index_status()
+
+    @staticmethod
+    def _embedding_status(provider: Any) -> dict[str, Any]:
+        if provider is None:
+            return {}
+        result = {"embedding_precision_policy": getattr(provider, "precision_policy", None),
+                  "embedding_effective_dtype": getattr(provider, "effective_dtype", None)}
+        device = getattr(provider, "device", None)
+        if device is not None:
+            result["embedding_device"] = getattr(device, "value", str(device))
+        return result
+
+    def embedding_status(self) -> dict[str, Any]:
+        """Refresh model facts without loading models or reading index storage."""
+        if hasattr(self.store, "stores"):
+            cached = self.index_snapshot.get("models", {})
+            return {"models": {
+                model: {**cached.get(model, {}),
+                        **self._embedding_status(getattr(store, "embedding_provider", None))}
+                for model, store in self.store.stores.items()
+            }}
+        return self._embedding_status(getattr(self.store, "embedding_provider", None))
 
     def reranker_status(self) -> dict[str, Any]:
         reranker = getattr(self.store, "reranker", None)
@@ -114,9 +137,7 @@ class KnowledgeApplication:
                 collection = store.settings.collection_name
                 details = {"collection": collection, "point_count": None}
                 details.update(await run_blocking(self.operation_log.index_status, collection))
-                device = getattr(store.embedding_provider, "device", None)
-                if device is not None:
-                    details["embedding_device"] = getattr(device, "value", str(device))
+                details.update(self._embedding_status(store.embedding_provider))
                 try:
                     async with asyncio.timeout(.25):
                         details["point_count"] = (await store.client.count(collection, exact=True)).count
@@ -137,9 +158,7 @@ class KnowledgeApplication:
             result.update(self.reranker_status())
             return result
         provider = getattr(self.store, "embedding_provider", None)
-        device = getattr(provider, "device", None)
-        if device is not None:
-            result["embedding_device"] = getattr(device, "value", str(device))
+        result.update(self._embedding_status(provider))
         if hasattr(self.store, "client"):
             try:
                 async with asyncio.timeout(.25):

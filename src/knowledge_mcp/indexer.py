@@ -38,6 +38,7 @@ class KnowledgeIndexer:
         self, settings: Settings, store: KnowledgeStore, tokenizer: Any, *,
         manifest: Manifest | None = None, operation_log: OperationLog | None = None,
         parser: Callable[[Path, Settings], SourceDocument] = parse_source,
+        embedding_precision: str | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -45,6 +46,7 @@ class KnowledgeIndexer:
         self.manifest = manifest if manifest is not None else Manifest(settings.runtime_dir, settings.collection_name)
         self.operation_log = operation_log if operation_log is not None else OperationLog(settings.runtime_dir)
         self.parser = parser
+        self.embedding_precision = embedding_precision
         self.progress = {"stage": "idle", "completed": 0, "total": 0}
 
     async def sync(self, *, assume_locked: bool = False, force_full_hash: bool = False) -> IndexRunSummary:
@@ -210,6 +212,7 @@ class KnowledgeIndexer:
             "dense_model": self.settings.dense_model,
             "bm25_model": "qdrant/bm25",
             "bm25_options": BM25_OPTIONS,
+            **({"embedding_precision": self.embedding_precision} if self.embedding_precision is not None else {}),
         }
 
     @staticmethod
