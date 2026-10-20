@@ -303,3 +303,153 @@ def test_synthetic_vault_has_own_empty_git_history_before_parser(tmp_path):
     assert Path(actual).resolve() == vault.resolve()
     history = subprocess.run(["git", "-C", str(vault), "log", "--oneline"], capture_output=True, text=True)
     assert not history.stdout.strip()
+
+
+def phase_evidence():
+    """Small protocol fixture; no vectors/models needed to test conjunction."""
+    import copy
+    identity = {"dataset_sha256": "frozen", "models": {"embedding": {"id": "m", "revision": "r"}},
+                "packages": {"torch": "installed"}, "inference_contract": {"batch_size": 8}, "python": "3"}
+    runtime = {"device": "cuda", "threads": 4}
+    roles = [(component, precision, "cuda") for component in ("embedding", "reranker")
+             for precision in ("default", "float32")]
+    roles += [("production_both", "float32", "cuda"), ("production_both", "auto", "cuda"),
+              ("production_both", "auto", "cpu")]
+    runs = [{"component": component, "requested_precision": precision, "requested_device": device,
+             "identity": copy.deepcopy(identity), "runtime": dict(runtime, device=device)}
+            for component, precision, device in roles]
+    compare = {"phase": "compare", "identity": copy.deepcopy(identity), "runs": runs,
+               "comparison": {"old_default_vs_explicit_fp32": {"embedding": {"pass": True}, "reranker": {"pass": True}},
+                              "old_explicit_vs_production_override": {"embedding": {"pass": True}},
+                              "production_fp32_vs_auto_vectors": {"pass": True}, "production_dtype_pass": True,
+                              "cpu_functional_dtype_pass": True, "performance": {"pass": True}}}
+    qdrant = {"phase": "qdrant", "identity": copy.deepcopy(identity),
+              "runs": [{"identity": copy.deepcopy(identity), "runtime": dict(runtime), "complete": True,
+                        "vector_diagnostics": {"pass": True}, "filter_violations": 0, "fallback_count": 0} for _ in range(2)],
+              "cpu_read": {"identity": copy.deepcopy(identity), "runtime": dict(runtime, device="cpu")},
+              "comparison": {"status": "PASS", "cpu_read_pass": True, "dtype_pass": True,
+                             "payload_bm25_semantics_equal": True, "schema_equal": True,
+                             "chunk_vector_comparison": {"pass": True}, "performance": {"pass": True},
+                             "quality": {key: {"pass": True} for key in ("candidates", "rerank_false", "same_candidate", "end_to_end")}}}
+    return compare, qdrant
+
+
+def test_joined_gate_requires_compare_and_every_worker():
+    module = harness()
+    compare, qdrant = phase_evidence()
+    assert module.join_phase_gates(None, qdrant)["status"] == "HOLD"
+    assert module.join_phase_gates(compare, None)["status"] == "HOLD"
+    assert module.join_phase_gates(compare, qdrant)["status"] == "PASS"
+    compare["runs"].pop()
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    compare, qdrant = phase_evidence()
+    qdrant["runs"].pop()
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+
+
+@pytest.mark.parametrize("key", ["dataset_sha256", "models", "packages", "inference_contract", "python"])
+def test_joined_gate_holds_on_cross_phase_or_worker_identity_drift(key):
+    module = harness()
+    compare, qdrant = phase_evidence()
+    compare["identity"][key] = "different"
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    compare, qdrant = phase_evidence()
+    compare["runs"][0]["identity"][key] = "different"
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    compare, qdrant = phase_evidence()
+    qdrant["cpu_read"]["identity"][key] = "different"
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+
+
+@pytest.mark.parametrize("path", [
+    ("old_default_vs_explicit_fp32", "embedding", "pass"),
+    ("old_default_vs_explicit_fp32", "reranker", "pass"),
+    ("old_explicit_vs_production_override", "embedding", "pass"),
+    ("production_fp32_vs_auto_vectors", "pass"), ("production_dtype_pass",),
+    ("cpu_functional_dtype_pass",), ("performance", "pass"),
+])
+def test_joined_gate_holds_on_each_false_or_missing_compare_gate(path):
+    module = harness()
+    compare, qdrant = phase_evidence()
+    target = compare["comparison"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = False
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    del target[path[-1]]
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+
+
+@pytest.mark.parametrize("path", [("dtype_pass",), ("payload_bm25_semantics_equal",), ("schema_equal",),
+                                 ("chunk_vector_comparison", "pass"), ("performance", "pass"),
+                                 *[("quality", key, "pass") for key in ("candidates", "rerank_false", "same_candidate", "end_to_end")]])
+def test_joined_gate_rejects_false_index_subgate_despite_cached_pass(path):
+    module = harness()
+    compare, qdrant = phase_evidence()
+    target = qdrant["comparison"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = False
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    del target[path[-1]]
+    assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+
+
+def test_joined_gate_holds_on_index_cpu_or_actual_runtime_failure():
+    module = harness()
+    for fault in ("index", "cpu", "runtime", "complete"):
+        compare, qdrant = phase_evidence()
+        if fault == "index":
+            qdrant["comparison"]["status"] = "HOLD"
+        elif fault == "cpu":
+            qdrant["comparison"]["cpu_read_pass"] = False
+        elif fault == "runtime":
+            qdrant["runs"][1]["runtime"]["threads"] = 8
+        else:
+            qdrant["runs"][0]["complete"] = False
+        assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+    for device in ("cuda", "cpu"):
+        compare, qdrant = phase_evidence()
+        run = next(row for row in compare["runs"] if row["requested_device"] == device)
+        run["runtime"]["threads"] = 8
+        assert module.join_phase_gates(compare, qdrant)["status"] == "HOLD"
+
+
+def test_finalize_cli_is_offline_and_binds_exact_artifacts(tmp_path, monkeypatch):
+    from hashlib import sha256
+    module = harness()
+    compare, qdrant = phase_evidence()
+    compare_path, qdrant_path = tmp_path / "compare.json", tmp_path / "qdrant.json"
+    compare_path.write_text(json.dumps(compare), encoding="utf-8")
+    qdrant_path.write_text(json.dumps(qdrant), encoding="utf-8")
+    monkeypatch.setattr(module, "prepare_identity", lambda *args: pytest.fail("offline finalize must not inspect model cache"))
+    monkeypatch.setattr(module, "run_worker", lambda *args: pytest.fail("offline finalize must not load models"))
+    monkeypatch.delenv("KNOWLEDGE_RUN_REAL_MODELS", raising=False)
+    output = tmp_path / "joined.json"
+    module.main(["--phase", "finalize", "--compare-artifact", str(compare_path), "--qdrant-artifact", str(qdrant_path), "--output", str(output)])
+    joined = json.loads(output.read_text(encoding="utf-8"))
+    assert joined["status"] == "PASS"
+    assert joined["input_artifacts"]["compare"]["sha256"] == sha256(compare_path.read_bytes()).hexdigest()
+    assert joined["input_artifacts"]["qdrant"]["identity"] == qdrant["identity"]
+    module.main(["--phase", "finalize", "--output", str(output)])
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "HOLD"
+
+
+def test_qdrant_cli_never_promotes_index_only_pass_to_final_pass(tmp_path, monkeypatch):
+    module = harness()
+    compare, qdrant = phase_evidence()
+    cpu = qdrant["cpu_read"]
+    for component in ("embedding", "reranker"):
+        cpu[component] = {"parameter_dtypes": {"torch.float32": 1}, "parameter_devices": {"cpu": 1}}
+        cpu[component + "_forward"] = [{"output_dtype": "torch.float32", "device": "cpu"}]
+    workers = iter([*qdrant["runs"], cpu])
+    monkeypatch.setattr(module, "prepare_identity", lambda *args: compare["identity"])
+    monkeypatch.setattr(module, "verify_owned_qdrant", lambda *args: {})
+    monkeypatch.setattr(module, "execute_child", lambda *args: next(workers))
+    monkeypatch.setattr(module, "qdrant_comparison", lambda *args: {"status": "PASS"})
+    monkeypatch.setenv("KNOWLEDGE_RUN_REAL_MODELS", "1")
+    output = tmp_path / "index-only.json"
+    module.main(["--phase", "qdrant", "--qdrant-url", "http://127.0.0.1:36333", "--output", str(output)])
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["comparison"]["status"] == "PASS"
+    assert result["status"] == "HOLD_pending_join"

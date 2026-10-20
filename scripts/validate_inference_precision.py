@@ -762,6 +762,86 @@ def qdrant_comparison(first, second, documents, queries):
             "schema_equal": schema_equal, "dtype_pass": dtype_ok, "performance": performance}
 
 
+def join_phase_gates(compare, qdrant):
+    """Only a complete, identity-bound conjunction may emit final PASS."""
+    result = {"status": "HOLD", "gates": {}, "reasons": []}
+    if compare is None or qdrant is None:
+        result["reasons"] = ["missing compare artifact" if compare is None else "missing Qdrant artifact"]
+        return result
+    try:
+        if compare["phase"] != "compare" or qdrant["phase"] != "qdrant":
+            raise ValueError("expected compare and Qdrant phase evidence")
+        require_comparable(compare["identity"], qdrant["identity"])
+        expected = Counter((component, precision, "cuda") for component in FROZEN_MODELS
+                           for precision in ("default", "float32"))
+        expected.update([("production_both", "float32", "cuda"), ("production_both", "auto", "cuda"),
+                         ("production_both", "auto", "cpu")])
+        actual = Counter((run["component"], run["requested_precision"], run["requested_device"])
+                         for run in compare["runs"])
+        if actual != expected or len(qdrant["runs"]) != 2:
+            raise ValueError("missing or duplicate mandatory worker evidence")
+        cuda_runtime = qdrant["runs"][0]["runtime"]
+        cpu_runtime = qdrant["cpu_read"]["runtime"]
+        if cuda_runtime["device"] != "cuda" or cpu_runtime["device"] != "cpu":
+            raise ValueError("wrong device in actual execution contract")
+        for run in compare["runs"]:
+            require_comparable(compare["identity"], run["identity"])
+            runtime = cpu_runtime if run["requested_device"] == "cpu" else cuda_runtime
+            if run["runtime"] != runtime:
+                raise ValueError("comparison identity mismatch: actual execution contract")
+        for run in qdrant["runs"]:
+            require_comparable(qdrant["identity"], run["identity"])
+            if run["runtime"] != cuda_runtime:
+                raise ValueError("comparison identity mismatch: actual execution contract")
+        require_comparable(qdrant["identity"], qdrant["cpu_read"]["identity"])
+        checks = compare["comparison"]
+        index = qdrant["comparison"]
+        result["gates"] = {
+            "original_embedding_fp32_parity": checks["old_default_vs_explicit_fp32"]["embedding"]["pass"] is True,
+            "original_reranker_fp32_parity": checks["old_default_vs_explicit_fp32"]["reranker"]["pass"] is True,
+            "production_override_vectors": checks["old_explicit_vs_production_override"]["embedding"]["pass"] is True,
+            "production_bf16_vectors": checks["production_fp32_vs_auto_vectors"]["pass"] is True,
+            "production_dtype": checks["production_dtype_pass"] is True,
+            "cpu_functional_smoke": checks["cpu_functional_dtype_pass"] is True,
+            "production_performance": checks["performance"]["pass"] is True,
+            "full_index_complete": all(run["complete"] is True for run in qdrant["runs"]),
+            "full_index_comparison": index["status"] == "PASS",
+            "full_index_dtype": index["dtype_pass"] is True,
+            "full_index_vectors": index["chunk_vector_comparison"]["pass"] is True,
+            "full_index_semantics": index["payload_bm25_semantics_equal"] is True and index["schema_equal"] is True,
+            "full_index_quality": all(index["quality"][key]["pass"] is True
+                                      for key in ("candidates", "rerank_false", "same_candidate", "end_to_end")),
+            "full_index_performance": index["performance"]["pass"] is True,
+            "full_index_safety": all(run["vector_diagnostics"]["pass"] is True and run["filter_violations"] == 0
+                                     and run["fallback_count"] == 0 for run in qdrant["runs"]),
+            "cpu_read": index["cpu_read_pass"] is True,
+        }
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        result["reasons"] = [f"invalid or incompatible phase evidence: {error}"]
+        return result
+    result["reasons"] = [name for name, passed in result["gates"].items() if not passed]
+    result["status"] = "HOLD" if result["reasons"] else "PASS"
+    return result
+
+
+def finalize_saved_phases(compare_path, qdrant_path):
+    artifacts, evidence = {}, {}
+    for name, path in (("compare", compare_path), ("qdrant", qdrant_path)):
+        artifacts[name] = {"path": str(path.resolve()) if path else None}
+        evidence[name] = None
+        if path is not None:
+            try:
+                data = path.read_bytes()
+                artifacts[name]["sha256"] = sha256(data).hexdigest()
+                evidence[name] = json.loads(data)
+                artifacts[name]["identity"] = evidence[name].get("identity")
+            except (OSError, ValueError, AttributeError) as error:
+                evidence[name] = None
+                artifacts[name]["error"] = type(error).__name__
+    return {"schema_version": 2, "phase": "finalize", **join_phase_gates(evidence["compare"], evidence["qdrant"]),
+            "input_artifacts": artifacts, "analysis_harness_sha256": sha256(Path(__file__).read_bytes()).hexdigest()}
+
+
 def execute_child(args, environment, phase, output, extra):
     command = [sys.executable, str(Path(__file__).resolve()), "--phase", phase, "--worker",
                "--output", str(output), "--dataset", str(args.dataset.resolve()),
@@ -785,12 +865,14 @@ def execute_child(args, environment, phase, output, extra):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("baseline", "compare", "qdrant"), required=True)
+    parser.add_argument("--phase", choices=("baseline", "compare", "qdrant", "finalize"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub")))
     parser.add_argument("--qdrant-url", help="owned test endpoint only: http://127.0.0.1:36333")
     parser.add_argument("--ownership", type=Path, default=ROOT / ".superpowers/sdd/2026-10-20-bf16-inference-migration/qdrant-owned.json")
+    parser.add_argument("--compare-artifact", type=Path, help="saved compare JSON for offline final joined verdict")
+    parser.add_argument("--qdrant-artifact", type=Path, help="saved Qdrant/CPU-read JSON for offline final joined verdict")
     parser.add_argument("--run-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--reference", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)
@@ -802,6 +884,11 @@ def main(argv=None):
     parser.add_argument("--precision", choices=("default", "float32", "auto"), help=argparse.SUPPRESS)
     parser.add_argument("--device", choices=("cpu", "cuda"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.phase == "finalize":
+        result = finalize_saved_phases(args.compare_artifact, args.qdrant_artifact)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return
     if (args.worker or not args.prepare_only) and os.environ.get("KNOWLEDGE_RUN_REAL_MODELS") != "1":
         parser.error("real inference requires KNOWLEDGE_RUN_REAL_MODELS=1 and an exclusive measurement window")
     if args.worker:
@@ -868,7 +955,8 @@ def main(argv=None):
                     result["comparison"]["cpu_read_pass"] = dtype_gate(cpu, "float32", "cpu")
                     if not result["comparison"]["cpu_read_pass"]:
                         result["comparison"]["status"] = "HOLD"
-                    result["status"] = result["comparison"]["status"]
+                    # A successful index phase alone is never the final gate.
+                    result["status"] = "HOLD_pending_join" if result["comparison"]["status"] == "PASS" else "HOLD"
                 args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 return
             for device in dict.fromkeys(args.devices):
