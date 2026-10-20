@@ -404,12 +404,13 @@ async def test_stdio_proxy_session_failure_shares_restart_and_recovers(applicati
     ("invalid", False, "reranker_invalid_scores"),
 ])
 async def test_reranking_outcomes_keep_text_and_structured_wire_contract(application, monkeypatch, mode, policy, applied, error):
+    import torch
     from knowledge_mcp.retrieval import MultiModelStore
     from test_retrieval import CandidateStore, result
     from types import SimpleNamespace
 
     class CrossEncoder:
-        def __init__(self, name, *, device):
+        def __init__(self, name, *, device, model_kwargs):
             if policy == "false":
                 pytest.fail("explicit false constructed model")
             if policy == "init":
@@ -417,7 +418,7 @@ async def test_reranking_outcomes_keep_text_and_structured_wire_contract(applica
         def predict(self, pairs, **kwargs):
             if policy == "inference":
                 raise RuntimeError("private inference payload")
-            return [.2, .8] if policy == "default" else [float("nan")]
+            return torch.tensor([.2, .8] if policy == "default" else [float("nan")])
 
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
@@ -434,7 +435,7 @@ async def test_reranking_outcomes_keep_text_and_structured_wire_contract(applica
             if isinstance(data, dict):
                 data = data["result"]
             assert [item["point_id"] for item in data] == (["b", "a"] if applied else ["a", "b"])
-            assert [item["score"] for item in data] == ([.8, .2] if applied else [.9, .1])
+            assert [item["score"] for item in data] == pytest.approx([.8, .2] if applied else [.9, .1])
             assert all(item["rerank_requested"] is (policy != "false") for item in data)
             assert all(item["rerank_applied"] is applied and item["rerank_error"] == error for item in data)
             assert [json.loads(block.text) for block in response.content] == data

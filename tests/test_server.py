@@ -121,7 +121,8 @@ async def test_status_reports_each_model_collection(settings):
     application = create_application(settings, store, log)
     result = await application.status()
     assert result["models"]["dragonkue/BGE-m3-ko"]["point_count"] == 11
-    assert result["reranker"] == {"model": "dragonkue/bge-reranker-v2-m3-ko", "loaded": False, "device": None, "last_fallback": None}
+    assert result["reranker"] == {"model": "dragonkue/bge-reranker-v2-m3-ko", "loaded": False, "device": None, "last_fallback": None,
+                                  "precision_policy": "auto", "effective_dtype": None}
     assert result["collection"] == "bge"
     assert result["point_count"] == 11
     assert result["status"] == "completed"
@@ -166,9 +167,9 @@ async def test_cached_status_refreshes_current_reranker_without_index_reads(sett
     import sys
 
     class CrossEncoder:
-        def __init__(self, name, *, device):
+        def __init__(self, name, *, device, model_kwargs):
             pass
-        def predict(self, pairs):
+        def predict(self, pairs, *, batch_size, convert_to_tensor):
             raise RuntimeError("private inference payload")
 
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
@@ -180,7 +181,8 @@ async def test_cached_status_refreshes_current_reranker_without_index_reads(sett
     await application.find(query="q")
     status = await application.status()
     assert status["point_count"] == 17
-    assert status["reranker"] == {"model": store.reranker.model_name, "loaded": True, "device": "cpu", "last_fallback": "reranker_inference_failed"}
+    assert status["reranker"] == {"model": store.reranker.model_name, "loaded": True, "device": "cpu", "last_fallback": "reranker_inference_failed",
+                                 "precision_policy": "auto", "effective_dtype": "float32"}
 
 
 @pytest.mark.anyio

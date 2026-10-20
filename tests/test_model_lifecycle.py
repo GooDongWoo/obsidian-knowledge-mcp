@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from knowledge_mcp.embeddings import LocalSentenceTransformerProvider
 from knowledge_mcp.reranker import LocalReranker
@@ -32,13 +33,13 @@ async def test_warmup_and_rerank_construct_one_cross_encoder(monkeypatch):
     constructors = []
 
     class CrossEncoder:
-        def __init__(self, name, *, device):
+        def __init__(self, name, *, device, model_kwargs):
             constructors.append(self)
             entered.set()
             assert release.wait(5)
 
-        def predict(self, pairs, *, batch_size=8):
-            return [.5] * len(pairs)
+        def predict(self, pairs, *, batch_size=8, convert_to_tensor):
+            return torch.tensor([.5] * len(pairs))
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
     reranker = LocalReranker()
@@ -64,15 +65,15 @@ async def test_cancelled_rerank_drains_predict_before_next_request(monkeypatch):
     predictions = []
 
     class CrossEncoder:
-        def __init__(self, name, *, device):
+        def __init__(self, name, *, device, model_kwargs):
             pass
 
-        def predict(self, pairs, *, batch_size=8):
+        def predict(self, pairs, *, batch_size=8, convert_to_tensor):
             predictions.append(pairs)
             if len(predictions) == 1:
                 entered.set()
                 assert release.wait(5)
-            return [.5] * len(pairs)
+            return torch.tensor([.5] * len(pairs))
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=CrossEncoder))
     reranker = LocalReranker()

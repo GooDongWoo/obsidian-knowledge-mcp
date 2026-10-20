@@ -6,6 +6,7 @@ import threading
 
 from .config import Settings
 from .embeddings import _MODEL_INFERENCE_LOCK, configure_torch_resources
+from .inference_precision import model_dtype_kwargs, require_cuda_bf16, resolve_torch_precision
 from .search import SearchResult
 from .state import run_blocking
 
@@ -25,6 +26,8 @@ class LocalReranker:
         self.batch_size = settings.reranker_batch_size if settings else 8
         self.cpu_threads = settings.cpu_threads if settings else 4
         self.cuda_memory_fraction = settings.cuda_memory_fraction if settings else None
+        self.precision_policy = settings.inference_precision if settings else "auto"
+        self.effective_dtype: str | None = None
         self._model = None
         self._lock = asyncio.Lock()
         self._model_lock = threading.Lock()
@@ -40,7 +43,8 @@ class LocalReranker:
     @property
     def status(self) -> dict:
         return {"model": self.model_name, "loaded": self.loaded,
-                "device": self.device, "last_fallback": self._last_fallback}
+                "device": self.device, "last_fallback": self._last_fallback,
+                "precision_policy": self.precision_policy, "effective_dtype": self.effective_dtype}
 
     def warmup(self) -> None:
         """Preload the cross-encoder model."""
@@ -62,17 +66,22 @@ class LocalReranker:
 
         if torch.cuda.is_available():
             try:
-                model = CrossEncoder(self.model_name, device="cuda")
+                dtype = resolve_torch_precision(self.precision_policy, "cuda")
+                require_cuda_bf16("cuda", dtype)
+                model = CrossEncoder(self.model_name, device="cuda", **model_dtype_kwargs(CrossEncoder, dtype))
             except Exception:
                 self._device_fallback = "reranker_cuda_init_failed"
             else:
                 self.device = "cuda"
+                self.effective_dtype = dtype
                 self._model = model
                 return
         else:
             self._device_fallback = "reranker_cuda_unavailable"
-        model = CrossEncoder(self.model_name, device="cpu")
+        dtype = resolve_torch_precision(self.precision_policy, "cpu")
+        model = CrossEncoder(self.model_name, device="cpu", **model_dtype_kwargs(CrossEncoder, dtype))
         self.device = "cpu"
+        self.effective_dtype = dtype
         self._model = model
         self._last_fallback = self._device_fallback
 
@@ -103,4 +112,13 @@ class LocalReranker:
     def _score(self, query: str, candidates: list[SearchResult]):
         with _MODEL_INFERENCE_LOCK:
             self.warmup()
-            return self._model.predict([(query, candidate.document) for candidate in candidates], batch_size=self.batch_size)
+            scores = self._model.predict(
+                [(query, candidate.document) for candidate in candidates],
+                batch_size=self.batch_size,
+                convert_to_tensor=True,
+            )
+            try:
+                return scores.detach().float().cpu().numpy()
+            except Exception:
+                self._last_fallback = "reranker_invalid_scores"
+                raise RerankError(self._last_fallback) from None
