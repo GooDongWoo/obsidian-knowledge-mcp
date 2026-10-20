@@ -5,12 +5,14 @@ import threading
 import warnings
 from typing import Sequence
 
+import numpy as np
 import onnxruntime as ort
 from fastembed import TextEmbedding
 from fastembed.common.types import Device
 
 from .config import DENSE_MODELS, Settings
 from .embedding_protocol import EmbeddingProvider, Tokenizer
+from .inference_precision import model_dtype_kwargs, require_cuda_bf16, resolve_torch_precision
 from .state import run_blocking
 
 
@@ -146,6 +148,9 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
         self.batch_size = settings.embedding_batch_size if settings else 8
         self.cpu_threads = settings.cpu_threads if settings else 4
         self.cuda_memory_fraction = settings.cuda_memory_fraction if settings else None
+        self.precision_policy = settings.inference_precision if settings else "auto"
+        self.effective_dtype = None
+        self.device = None
         self.model_name = model_name
         self._model = None
         self._model_lock = threading.Lock()
@@ -154,10 +159,18 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
     def model(self):
         with self._model_lock:
             if self._model is None:
+                import torch
+
                 configure_torch_resources(self.cpu_threads, self.cuda_memory_fraction)
                 from sentence_transformers import SentenceTransformer
 
-                self._model = SentenceTransformer(self.model_name)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                dtype = resolve_torch_precision(self.precision_policy, device)
+                require_cuda_bf16(device, dtype)
+                self._model = SentenceTransformer(
+                    self.model_name, device=device, **model_dtype_kwargs(SentenceTransformer, dtype)
+                )
+                self.device, self.effective_dtype = device, dtype
         return self._model
 
     def warmup(self) -> None:
@@ -173,10 +186,20 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
         return vectors[0].tolist()
 
     def _encode(self, documents: list[str]):
+        if not documents:
+            return np.empty((0, self.get_vector_size()), dtype=np.float32)
         # Resolve the lazy model in the worker too: evaluating self.model.encode
         # before dispatch would construct it on the event loop on first use.
         with _MODEL_INFERENCE_LOCK:
-            return self.model.encode(documents, batch_size=self.batch_size, normalize_embeddings=True)
+            vectors = np.asarray(
+                self.model.encode(documents, batch_size=self.batch_size, normalize_embeddings=True),
+                dtype=np.float32,
+            )
+        if vectors.shape != (len(documents), self.get_vector_size()):
+            raise ValueError("Invalid embedding shape")
+        if not np.isfinite(vectors).all() or not np.any(vectors != 0, axis=1).all():
+            raise ValueError("Invalid embedding: vectors must be finite and nonzero")
+        return vectors
 
     def get_vector_name(self) -> str:
         return f"st-{self.model_name.split('/')[-1].lower()}"

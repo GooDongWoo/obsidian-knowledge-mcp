@@ -3,6 +3,7 @@
 import asyncio
 import sys
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,12 @@ from knowledge_mcp.embeddings import LocalSentenceTransformerProvider
 from knowledge_mcp.reranker import LocalReranker
 from knowledge_mcp.state import async_index_lock
 from test_retrieval import result
+
+
+@pytest.fixture(autouse=True)
+def cpu_torch_device(monkeypatch):
+    # Each CUDA-specific test overrides this; never depend on the host GPU.
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
 
 
 @pytest.fixture
@@ -89,36 +96,53 @@ async def test_cancelled_rerank_drains_predict_before_next_request(monkeypatch):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("method,argument", [("embed_documents", ["document"]), ("embed_query", "query")])
-async def test_first_embedding_model_construction_stays_off_event_loop(monkeypatch, method, argument):
+@pytest.mark.parametrize("cuda", [False, True])
+async def test_first_embedding_model_construction_stays_off_event_loop(monkeypatch, method, argument, cuda):
     owner_thread = threading.get_ident()
+    probes = []
+    def supported(including_emulation=True):
+        assert threading.get_ident() != owner_thread, "bf16 preflight blocked the event loop"
+        probes.append(including_emulation)
+        return True
+    monkeypatch.setattr("torch.cuda.is_available", lambda: cuda)
+    monkeypatch.setattr("torch.cuda.device", lambda _: nullcontext())
+    monkeypatch.setattr("torch.cuda.is_bf16_supported", supported)
 
     class SentenceTransformer:
-        def __init__(self, name):
+        def __init__(self, name, *, device=None, model_kwargs=None):
             assert threading.get_ident() != owner_thread, "model construction blocked the event loop"
 
         def encode(self, documents, **kwargs):
-            return np.zeros((len(documents), 1024))
+            return np.full((len(documents), 1024), 1 / 32, dtype=np.float32)
 
     monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))
     provider = LocalSentenceTransformerProvider("test-model")
     vectors = await getattr(provider, method)(argument)
     assert len(vectors) == (1 if method == "embed_documents" else 1024)
+    assert probes == ([False] if cuda else [])
 
 
 @pytest.mark.anyio
-async def test_embedding_warmup_and_first_query_construct_one_model(monkeypatch):
+@pytest.mark.parametrize("cuda", [False, True])
+async def test_embedding_warmup_and_first_query_construct_one_model(monkeypatch, cuda):
     entered, release = threading.Event(), threading.Event()
-    constructors = []
+    constructors, probes = [], []
+    monkeypatch.setattr("torch.cuda.is_available", lambda: cuda)
+    monkeypatch.setattr("torch.cuda.device", lambda _: nullcontext())
+    def supported(including_emulation=True):
+        probes.append(including_emulation)
+        return True
+    monkeypatch.setattr("torch.cuda.is_bf16_supported", supported)
 
     class SentenceTransformer:
-        def __init__(self, name):
+        def __init__(self, name, *, device=None, model_kwargs=None):
             constructors.append(self)
             entered.set()
             assert release.wait(5)
 
         def encode(self, documents, **kwargs):
-            return np.zeros((len(documents), 1024))
+            return np.full((len(documents), 1024), 1 / 32, dtype=np.float32)
 
     monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))
@@ -134,6 +158,7 @@ async def test_embedding_warmup_and_first_query_construct_one_model(monkeypatch)
         await warmup
         assert len(await query) == 1024
         assert len(constructors) == 1
+        assert probes == ([False] if cuda else [])
     finally:
         release.set()
         await asyncio.gather(warmup, *([query] if query else []), return_exceptions=True)
@@ -145,7 +170,7 @@ def blocked_provider(monkeypatch, request):
     calls = []
 
     class SentenceTransformer:
-        def __init__(self, name):
+        def __init__(self, name, *, device=None, model_kwargs=None):
             pass
 
         def encode(self, documents, **kwargs):
@@ -153,7 +178,7 @@ def blocked_provider(monkeypatch, request):
             entered.set()
             assert release.wait(5)
             finished.set()
-            return np.zeros((len(documents), 1024))
+            return np.full((len(documents), 1024), 1 / 32, dtype=np.float32)
 
     monkeypatch.setattr("knowledge_mcp.embeddings.configure_torch_resources", lambda *_: None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=SentenceTransformer))

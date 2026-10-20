@@ -12,6 +12,12 @@ from knowledge_mcp.documents import (
 from knowledge_mcp.indexer import KnowledgeIndexer
 
 
+@pytest.fixture(autouse=True)
+def cpu_torch_device(monkeypatch):
+    # Each CUDA-specific test overrides this; never depend on the host GPU.
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+
 @pytest.fixture
 def settings(tmp_path):
     vault = tmp_path / "vault"
@@ -267,8 +273,8 @@ def test_integer_cuda_fraction_reaches_real_torch_validation(settings, monkeypat
     monkeypatch.setattr(embeddings.os, "cpu_count", lambda: 4)
     monkeypatch.setattr(embeddings, "_configured_cuda_budget", None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(
-        SentenceTransformer=lambda *_: object(), CrossEncoder=lambda *_, **__: object()))
-    configured = replace(settings, cuda_memory_fraction=1)
+        SentenceTransformer=lambda name, *, device, model_kwargs: object(), CrossEncoder=lambda *_, **__: object()))
+    configured = replace(settings, cuda_memory_fraction=1, inference_precision="float32")
     provider = (embeddings.LocalSentenceTransformerProvider(settings.dense_model, settings=configured)
                 if backend == "embedding" else LocalReranker(settings=configured))
     provider.warmup()
@@ -289,7 +295,7 @@ def test_model_inference_is_serialized_across_embedding_and_reranker(monkeypatch
     def encode(*_, **__):
         entered.set()
         assert release.wait(5)
-        return np.zeros((1, 1024))
+        return np.full((1, 1024), 1 / 32, dtype=np.float32)
     provider._model = SimpleNamespace(encode=encode)
     reranker = LocalReranker()
     reranker._model = SimpleNamespace(predict=lambda *_, **__: predicted.set() or [.2])
@@ -320,11 +326,11 @@ async def test_cli_dependencies_apply_selected_resource_settings(settings, monke
     calls = []
     class Model:
         tokenizer = object()
-        def __init__(self, name):
+        def __init__(self, name, *, device=None, model_kwargs=None):
             pass
         def encode(self, texts, *, batch_size, normalize_embeddings):
             calls.append(("embedding", batch_size))
-            return np.zeros((len(texts), 1024))
+            return np.full((len(texts), 1024), 1 / 32, dtype=np.float32)
     class CrossEncoder:
         def __init__(self, name, *, device):
             pass
