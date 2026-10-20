@@ -48,7 +48,7 @@ def test_env_file_loading_in_settings(tmp_path, monkeypatch):
     settings = Settings.from_env("test-client")
     assert settings.vault_root == vault.resolve()
     assert settings.project_root == project.resolve()
-    assert settings.qdrant_url == "http://127.0.0.1:6333"
+    assert settings.qdrant_url == Settings.DEFAULT_QDRANT_URL
 
 
 def test_missing_vault_root_raises_error(tmp_path, monkeypatch):

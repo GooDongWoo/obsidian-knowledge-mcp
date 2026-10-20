@@ -65,8 +65,11 @@ class Settings:
 
     qdrant_executable: str | None = None
     qdrant_native_storage: Path | None = None
+    inference_precision: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.inference_precision not in ("auto", "float32"):
+            raise ValueError("inference_precision must be auto or float32")
         if self.project_root is None:
             object.__setattr__(self, "project_root", self.vault_root / "00_System" / "knowledge-mcp")
         if self.project_root.resolve() == self.vault_root.resolve():
@@ -159,4 +162,5 @@ class Settings:
                 if os.environ.get("KNOWLEDGE_ONNX_GPU_MEM_LIMIT") else None,
             onnx_arena_extend_strategy=os.environ.get("KNOWLEDGE_ONNX_ARENA_EXTEND_STRATEGY", "kSameAsRequested"),
             onnx_intra_op_num_threads=int(os.environ.get("KNOWLEDGE_ONNX_INTRA_OP_NUM_THREADS", "4")),
+            inference_precision=os.environ.get("KNOWLEDGE_INFERENCE_PRECISION", "auto"),
         )
