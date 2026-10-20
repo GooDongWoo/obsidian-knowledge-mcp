@@ -5,6 +5,7 @@ from knowledge_mcp.config import Settings
 from knowledge_mcp.documents import discover_sources
 
 
+@pytest.mark.env_loading
 def test_cli_loads_fastmcp_settings_before_import(tmp_path):
     import os
     import subprocess
@@ -25,6 +26,7 @@ def test_cli_loads_fastmcp_settings_before_import(tmp_path):
     )
 
 
+@pytest.mark.env_loading
 def test_env_file_loading_in_settings(tmp_path, monkeypatch):
     vault = tmp_path / "my_vault"
     vault.mkdir()
