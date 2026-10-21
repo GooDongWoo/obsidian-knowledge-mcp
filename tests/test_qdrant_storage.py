@@ -66,8 +66,8 @@ def test_native_launcher_absolute_paths_loopback_hidden_and_health_wait(settings
     assert args[0][0] == str(Path(settings.qdrant_executable).resolve())
     env = kwargs["env"]
     assert env["QDRANT__SERVICE__HOST"] == "127.0.0.1"
-    assert env["QDRANT__SERVICE__HTTP_PORT"] == "6333"
-    assert env["QDRANT__SERVICE__GRPC_PORT"] == "6334"
+    assert env["QDRANT__SERVICE__HTTP_PORT"] == "26333"
+    assert env["QDRANT__SERVICE__GRPC_PORT"] == "26334"
     assert env["QDRANT__STORAGE__STORAGE_PATH"] == str(settings.qdrant_storage_dir)
     assert Path(env["QDRANT__STORAGE__SNAPSHOTS_PATH"]).is_absolute()
     assert env["QDRANT__TELEMETRY_DISABLED"] == "true"
