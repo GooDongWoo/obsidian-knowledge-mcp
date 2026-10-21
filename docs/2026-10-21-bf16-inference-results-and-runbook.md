@@ -250,6 +250,6 @@ Vault 존재/읽기 및 `vault_id` preflight를 다시 수행하고 startup sync
 
 ## 7. 문서화 단계의 회귀 검증
 
-실제 ML opt-in을 해제한 최종 offline 전체 회귀는 **382 passed in 165.81s**, 별도 소유 Qdrant integration은 **18 passed in 21.76s**였다. 두 suite는 순차 실행했고 integration은 검증 전용 36333 서버만 사용했다. 저장된 실험의 offline finalize도 16/16 PASS였다. 이번 단계에서 실제 모델 실행·운영 재색인·서비스 전환을 추가로 수행하지 않았다.
+최종 리뷰의 일반 테스트 `.env` 로더 별칭 격리 수정과 두 discovery 회귀 사례를 반영한 뒤, 실제 ML opt-in을 해제한 최종 offline 전체 회귀는 **384 passed in 164.69s**, 별도 소유 Qdrant integration은 **18 passed in 21.41s**였다. 두 suite는 순차 실행했고 integration은 검증 전용 36333 서버만 사용했다. 저장된 실험의 offline finalize도 16/16 PASS였다. 이번 단계에서 실제 모델 실행·운영 재색인·서비스 전환을 추가로 수행하지 않았다.
 
-최초 전체 실행은 legacy stdio proxy 복구 사례에서 내부 25초 제한 이후에도 종료되지 않아 소유 pytest tree만 검증 후 중단했다. 해당 사례 단독 실행은 1 passed in 5.66s, 이후 전체 실행 두 번에서는 지연이 재현되지 않았다. 원인이 규명되거나 proxy가 수정된 것은 아니다. 첫 완료 회귀의 유일한 실패는 baseline부터 현재 native 기본 포트 26333/26334와 테스트 기대값 6333/6334가 달랐던 기존 불일치였다(381 passed/1 failed). 해당 기대값 두 줄만 정정한 focused RED 1 failed/9 passed→GREEN 10 passed를 거친 뒤 최종 382개 전체 통과를 확인했다. 운영 endpoint 정책이나 legacy 6333 입력 alias는 바꾸지 않았다. 원시 로그와 중단된 실행 증거는 로컬 ignored 경로에 보존했다.
+최초 전체 실행은 legacy stdio proxy 복구 사례에서 내부 25초 제한 이후에도 종료되지 않아 소유 pytest tree만 검증 후 중단했다. 해당 사례 단독 실행은 1 passed in 5.66s, 이후 전체 실행 두 번과 이번 격리 수정 후 전체 실행에서는 지연이 재현되지 않았다. 원인이 규명되거나 proxy가 수정된 것은 아니다. 첫 완료 회귀의 유일한 실패는 baseline부터 현재 native 기본 포트 26333/26334와 테스트 기대값 6333/6334가 달랐던 기존 불일치였다(381 passed/1 failed). 해당 기대값 두 줄만 정정한 focused RED 1 failed/9 passed→GREEN 10 passed를 거친 뒤 당시 382개 전체 통과를 확인했다. 운영 endpoint 정책이나 legacy 6333 입력 alias는 바꾸지 않았다. 원시 로그와 중단된 실행 증거는 로컬 ignored 경로에 보존했다.

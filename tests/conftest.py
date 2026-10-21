@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from knowledge_mcp import config
+from knowledge_mcp import config, documents
 
 
 def pytest_collection_modifyitems(config, items):
@@ -23,3 +23,4 @@ def isolated_knowledge_env(monkeypatch, request):
             monkeypatch.delenv(key, raising=False)
     if request.node.get_closest_marker("env_loading") is None:
         monkeypatch.setattr(config, "_load_env_file", lambda *_: None)
+        monkeypatch.setattr(documents, "_load_env_file", lambda *_: None)

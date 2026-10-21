@@ -1,8 +1,38 @@
 from pathlib import Path
+import os
 import pytest
 
 from knowledge_mcp.config import Settings
 from knowledge_mcp.documents import discover_sources
+
+
+@pytest.mark.parametrize(
+    ("expected_sources", "expected_sentinel"),
+    [
+        (["note.pdf"], None),
+        pytest.param([], "loaded", marks=pytest.mark.env_loading),
+    ],
+)
+def test_discovery_dotenv_loading_requires_explicit_marker(
+    tmp_path, monkeypatch, expected_sources, expected_sentinel
+):
+    # discover_sources is imported during collection, before the autouse fixture.
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.pdf").write_bytes(b"%PDF-1.4\n")
+    (tmp_path / ".env").write_text(
+        "KNOWLEDGE_DISCOVERY_SENTINEL=loaded\nKNOWLEDGE_EXTRA_IGNORES=**/*.pdf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KNOWLEDGE_DISCOVERY_SENTINEL", raising=False)
+    monkeypatch.delenv("KNOWLEDGE_EXTRA_IGNORES", raising=False)
+    settings = Settings.from_paths(vault_root=vault, project_root=tmp_path)
+
+    discovered = discover_sources(settings)
+
+    assert [path.name for path in discovered] == expected_sources
+    assert os.environ.get("KNOWLEDGE_DISCOVERY_SENTINEL") == expected_sentinel
 
 
 @pytest.mark.env_loading
