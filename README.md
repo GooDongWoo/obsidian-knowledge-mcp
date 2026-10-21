@@ -24,7 +24,7 @@ In a modern development setup, multiple AI agents (e.g., **Codex**, **Claude Cod
 
 ### 1.3 The Solution: Single HTTP Daemon + Lightweight Stdio Protocol Proxy
 To permanently solve these resource bottlenecks, the architecture was restructured:
-1. **Single HTTP Daemon**: A dedicated background service (`FastMCP 4.0.10`, MCP SDK `2.2.0`) hosts exactly **one** shared copy of the embedding and re-ranking models (~4.6GB total). It serves Streamable HTTP at `http://127.0.0.1:8765/mcp` and process health at `/health`.
+1. **Single HTTP Daemon**: A dedicated background service (`FastMCP 4.0.10`, MCP SDK `2.2.0`) hosts **one** shared copy of the embedding and re-ranking models. Actual memory depends on precision, inputs and allocator state. It serves Streamable HTTP at `http://127.0.0.1:8765/mcp` and process health at `/health`.
 2. **Lightweight Stdio Protocol Proxy**: AI clients launch `knowledge-mcp serve` without importing heavy ML libraries. The official FastMCP proxy mirrors the client's protocol era: modern clients use MCP `2026-07-28` on both sides, while legacy clients retain normal initialize-based negotiation. Modern `server/discover` requests are supported without a forced legacy fallback.
 3. **5-Layer Resource Guardrails**:
    - **CPU Thread Clamping**: PyTorch inference defaults to 4 threads, clamped to the available CPU count. This controls inference parallelism; CPU utilization can still spike.
@@ -38,6 +38,12 @@ The default BGE embedding and reranker use SentenceTransformer/PyTorch. Configur
 `KNOWLEDGE_CUDA_MEMORY_FRACTION` is optional and must be greater than 0 and at most 1. It configures PyTorch's process CUDA allocator budget before model loading; unset preserves PyTorch's default. The fraction covers allocator-managed memory, not total VRAM: CUDA context, other allocations and other processes remain outside it. A budget too small for the models or a batch can cause an allocation failure. CPU threads and the GPU allocator budget are process settings. Restart the daemon after changing them. Resource settings preserve model precision, token length and vector normalization, and changing only these settings does not require reindexing.
 
 The retained `LocalFastEmbedProvider` exposes separate ONNX controls: `KNOWLEDGE_ONNX_GPU_MEM_LIMIT` (positive bytes, optional), `KNOWLEDGE_ONNX_ARENA_EXTEND_STRATEGY` (`kSameAsRequested`, the default, or `kNextPowerOfTwo`), and `KNOWLEDGE_ONNX_INTRA_OP_NUM_THREADS` (positive integer, default 4, clamped to the host CPU count). They reach ONNX Runtime's actual session/provider creation. `gpu_mem_limit` limits only the CUDA execution provider's arena and cannot cap total GPU memory. FastEmbed falls back to the CPU provider when CUDA initialization fails. These options apply only when constructing the retained FastEmbed provider; the supported default BGE model and CLI use PyTorch, and no ONNX model is added to the supported model list.
+
+`KNOWLEDGE_INFERENCE_PRECISION=auto` is the common PyTorch embedding/reranker default: CUDA uses `bfloat16`, CPU uses `float32`. Set `float32` to override both models. CUDA auto requires verified **native** BF16 support; unsupported or unprovable support fails embedding initialization. The reranker retains its existing CPU construction retry and uses FP32 on CPU. This policy does not alter FastEmbed/ONNX, BM25, Qdrant storage dtype, or guarantee BF16 for every kernel. Stop and restart the daemon after changing policy; `daemon start` on a running daemon does not reload settings.
+
+Effective embedding dtype is included in index identity. A dtype change triggers a full rewrite at the next sync; preserve the old collection/manifest and select a new versioned collection for cutover. Pre-index with CLI, let it exit, then start the daemon: startup sync should be unchanged only when the new code's dtype signature and sources match. Old manifests without a precision key also require one full sync, even under `float32`. CPU queries against a BF16 corpus have bounded functional coverage; CPU document writes require a complete FP32 reindex with consumers paused.
+
+The [2026-10-21 BF16 results and cutover runbook](docs/2026-10-21-bf16-inference-results-and-runbook.md) records a joined synthetic Windows gate PASS: steady CUDA allocation −49.7% and warm end-to-end p95 −70.5%, **but host end RSS increased from 2.10 to 3.38 GiB and peak RSS also increased**. Quality intervals include zero, critical omissions remain 1→1, and exact adjacent score ties increased 291→1114. These results establish relative gates, not accuracy improvement or production readiness. Production BF16 cutover and long observation remain pending.
 
 ### 1.4 Hybrid Retrieval + Cross-Encoder Re-ranking
 - **Dense Vector Search**: Powered by `dragonkue/BGE-m3-ko` (1024 dimensions) for deep semantic matching.
@@ -81,7 +87,7 @@ The retained `LocalFastEmbedProvider` exposes separate ONNX controls: `KNOWLEDGE
    ├── bge-reranker-v2-m3-ko (CUDA/CPU Warmup)
    └── FastMCP Tools: qdrant-find, knowledge-index-status, knowledge-index-sync
          │
-         ├──> [ Local Qdrant 1.19.1 ] (Port 6333 / 6334)
+         ├──> [ Local Qdrant 1.19.1 ] (Port 26333 / 26334)
          │       └── Dense vectors, BM25 index, text chunks & payloads
          │
          └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
@@ -160,7 +166,7 @@ Streamable HTTP uses one `/mcp` endpoint with POST requests and JSON or request-
 
 The `qdrant-mcp` extra has been removed: its old `mcp-server-qdrant==0.8.1` dependency pins FastMCP `2.7.0` and Pydantic `<2.12.0`. If you need that separate server, keep it in a separate FastMCP 2 environment.
 
-For an existing installation, create a fresh `.venv` in a separate checkout/worktree. Retain the original checkout, editable environment, and client settings for rollback; do not upgrade the original environment in place or copy a virtual environment. The migration changes transport and protocol, with no required collection rebuild, model change, or SQLite/Qdrant format change.
+For an existing installation, create a fresh `.venv` in a separate checkout/worktree. Retain the original checkout, editable environment, and client settings for rollback; do not upgrade the original environment in place or copy a virtual environment. The transport/protocol migration alone requires no collection rebuild or SQLite/Qdrant format change. The separate inference precision migration above requires a full sync when embedding dtype or the legacy precision signature changes.
 
 ---
 
@@ -190,7 +196,7 @@ Configure the official Qdrant 1.19.1 executable, then execute the initial index:
 $env:KNOWLEDGE_QDRANT_EXECUTABLE = "C:/Tools/qdrant-1.19.1/qdrant.exe"
 .\.venv\Scripts\knowledge-mcp.exe index
 ```
-- A healthy localhost Qdrant is reused. Otherwise the launcher starts the configured native executable (or `qdrant` on PATH), bound to 127.0.0.1. Services should use the absolute executable path.
+- A healthy localhost Qdrant at HTTP `127.0.0.1:26333` (gRPC `26334`) is reused. Legacy URL input `http://127.0.0.1:6333` is normalized to `26333`. Otherwise the launcher starts the configured native executable (or `qdrant` on PATH), bound to 127.0.0.1. Services should use the absolute executable path.
 - Native data defaults to `%USERPROFILE%/.knowledge-qdrant/<project-path-hash>`; set `KNOWLEDGE_QDRANT_NATIVE_STORAGE` to a short absolute path if needed. Existing nonempty directories without the native ownership marker are refused.
 - Existing Docker data remains under `KNOWLEDGE_QDRANT_STORAGE` (default `.knowledge/qdrant`). Select `KNOWLEDGE_QDRANT_BACKEND=docker` explicitly for rollback. An existing installation needs a snapshot restore into new native storage before cutover; see the [migration and optional Windows service procedure](docs/qdrant-status-and-diagnostics.md#native-qdrant-migration).
 - The first run downloads the embedding model and builds the initial index. Subsequent runs are fully incremental.
@@ -266,6 +272,8 @@ HTTP/MCP opens before Qdrant setup, model loading, initial incremental sync, and
 Search requests default to `rerank=true`; explicit `false` preserves RRF ranking and does not load the reranker during search. CUDA initialization failure triggers one CPU construction retry. Successful CPU reranking reports `rerank_applied=true`. If initialization, inference, or score validation fails, search returns the original RRF scores/order with `rerank_requested=true`, `rerank_applied=false`, and `rerank_error` set to `reranker_init_failed`, `reranker_inference_failed`, or `reranker_invalid_scores`. Initialization failure is cached for the reranker instance; restart the daemon to retry loading. Inference and score failures can recover on the next search. Each result carries these fields in both the per-result text output and structured `{"result": [...]}` envelope. Scores are raw cross-encoder relevance scores only when `rerank_applied=true`; source caps and the final limit are applied after ranking. Empty searches do not apply or load the reranker.
 
 Status includes the actual reranker `device` (`cuda`, `cpu`, or `null` before successful initialization), `loaded`, and `last_fallback`. The fallback code distinguishes CPU selection (`reranker_cuda_unavailable` / `reranker_cuda_init_failed`) from an RRF fallback. A subsequent successful rerank resets the last inference/score failure to its device selection fallback, or `null` for CUDA. These lightweight fields refresh on each status request without querying Qdrant.
+
+Live precision status adds `embedding_precision_policy`, `embedding_effective_dtype`, and `embedding_device` to each model entry under `models` (or the top level for a single store). `reranker` adds `precision_policy` and `effective_dtype`; unresolved values can be `null`. These fields report current loaded model facts without loading a model or refreshing Qdrant. Inspect both models, fallback codes, completed index status and actual searches before reconnecting consumers.
 
 During active indexing, `qdrant-find` returns an explicit indexing/retry tool error. Before models exist it reports starting or initialization failure. Once indexing stops, searches can use a valid existing collection even if the latest sync was partial; Qdrant connection errors are reported as search errors. Optional warmup failure is reported as `warmup_error` and leaves base retrieval available. Initial and manual sync share one writer queue. Shutdown cancels managed work, finishes any already-running file/SQLite/model thread operation, records interrupted sync, and closes Qdrant clients on their owning event loop. A native model operation already in progress can delay graceful shutdown.
 

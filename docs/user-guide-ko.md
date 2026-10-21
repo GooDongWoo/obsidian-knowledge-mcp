@@ -21,14 +21,14 @@
    ├── bge-reranker-v2-m3-ko 리랭커 (CUDA/CPU 워밍업)
    └── FastMCP 도구 제공 (qdrant-find, knowledge-index-status, knowledge-index-sync)
          │
-         ├──> [ 로컬 Qdrant 1.19.1 ] (127.0.0.1:6333, 6334)
+         ├──> [ 로컬 Qdrant 1.19.1 ] (127.0.0.1:26333, 26334)
          │       └── 벡터 임베딩, BM25 인덱스, 문서 청크 및 메타데이터
          │
          └──> [ SQLite State ] (Project/.knowledge/state.sqlite3)
                  └── 파일별 완료 기록, 인덱스 실행 로그, 질의 통계
 ```
 
-- **로컬 Qdrant**: Windows 네이티브 1.19.1 바이너리를 사용합니다. 정상 실행 중인 로컬 서비스(127.0.0.1:6333)도 자동으로 감지하여 재사용합니다.
+- **로컬 Qdrant**: Windows 네이티브 1.19.1 바이너리를 사용합니다. 정상 실행 중인 로컬 서비스(HTTP 127.0.0.1:26333, gRPC 26334)도 감지하여 재사용합니다. 구 URL 입력 `http://127.0.0.1:6333`은 26333으로 정규화됩니다.
 - **단일 HTTP 데몬**: FastMCP `4.0.10`과 MCP SDK `2.2.0`을 사용하며, 무거운 딥러닝 모델(`BGE-m3-ko`, 리랭커)을 1벌만 메모리에 상주시킵니다.
 - **경량 Stdio protocol 프록시**: AI 에이전트(Codex 등)의 진입점으로, 무거운 ML 라이브러리를 로드하지 않습니다. 공식 FastMCP 프록시가 클라이언트의 protocol era를 그대로 반영하여 modern→modern, legacy→legacy로 연결합니다. 최신 `server/discover` 요청을 강제로 거절하거나 legacy로 강등시키지 않습니다.
 - **로컬 보안 원칙**: 외부 Qdrant Cloud나 상용 임베딩 API를 사용하지 않으며, 모든 임베딩과 검색은 PC 내부에서 처리됩니다.
@@ -76,7 +76,7 @@ pip check
 > [!NOTE]
 > `pyproject.toml`에서 `sys_platform != 'win32'`일 경우 `fastembed-gpu`, `onnxruntime-gpu`, `nvidia-*` 패키지가 제외되고 경량 `fastembed`, `onnxruntime` CPU 휠이 설치됩니다.
 
-기존 설치에서 전환할 때는 **별도 checkout/worktree에 새 `.venv`를 생성**합니다. 원래 checkout과 editable 가상환경 및 클라이언트 설정은 롤백용으로 그대로 보존하고, 원래 환경을 제자리 업그레이드하거나 가상환경을 복사하여 재사용하지 마세요. 프로토콜 전환에 모델 변경, 컬렉션 재생성, SQLite/Qdrant 포맷 변경은 필요하지 않습니다.
+기존 설치에서 전환할 때는 **별도 checkout/worktree에 새 `.venv`를 생성**합니다. 원래 checkout과 editable 가상환경 및 클라이언트 설정은 롤백용으로 그대로 보존하고, 원래 환경을 제자리 업그레이드하거나 가상환경을 복사하여 재사용하지 마세요. 프로토콜 전환 자체에는 컬렉션 재생성이나 SQLite/Qdrant 포맷 변경이 필요하지 않습니다. 별도 BF16 정밀도 전환은 아래의 전체 동기화 조건을 따릅니다.
 
 ### 2.2 환경변수 설정
 
@@ -116,6 +116,16 @@ FASTMCP_DEPRECATION_WARNINGS=true
 ```
 
 프로젝트는 global OpenTelemetry exporter를 구성하지 않습니다. SDK tracing 의존성의 설치 자체가 원격 export를 의미하지 않으며, 노트 임베딩과 검색은 로컬에서 처리됩니다.
+
+### 2.3 PyTorch 추론 정밀도와 기존 인덱스 전환
+
+`KNOWLEDGE_INFERENCE_PRECISION`은 `auto`(기본) 또는 `float32`만 허용합니다. `auto`는 CUDA 임베딩·리랭커를 BF16으로, CPU에서는 둘 다 FP32로 로드합니다. `float32`는 두 모델의 공통 복귀 설정입니다. CUDA의 native BF16 지원을 확인하지 못하면 임베딩 초기화가 실패합니다. 리랭커는 기존 방식대로 CUDA 초기화 실패 시 CPU 생성 1회를 재시도하고 FP32로 실행합니다. 필요하면 공통 `float32`를 선택하세요. FastEmbed/ONNX·BM25·Qdrant 저장 dtype은 바꾸지 않으며 모든 연산 커널이 BF16이라고 보장하지 않습니다.
+
+설정 변경 뒤에는 데몬을 중지하고 다시 시작해야 합니다. 실행 중 `daemon start`는 새 설정을 적용하지 않습니다. **실효 임베딩 dtype은 색인 signature에 포함**되므로 바뀌면 다음 sync가 전체 문서를 다시 처리합니다. precision 키가 없던 구 버전 manifest에서 새 코드로 전환할 때도 `float32` 여부와 관계없이 1회 전체 동기화가 필요합니다. 기존 컬렉션·manifest를 보존하고 새 `KNOWLEDGE_COLLECTION`으로 전체 색인하세요. CLI 색인 프로세스가 종료된 뒤 데몬을 시작하면 같은 새 signature·소스의 startup sync는 unchanged여야 합니다.
+
+CPU 질의로 BF16 컬렉션을 읽는 것은 제한된 실검증을 통과했습니다. CPU에서 문서를 쓰면 FP32 signature로 전체 재색인하므로 소비 클라이언트와 자동 기동을 중지하고 성공 후 재개해야 합니다. 기존 구 버전 코드·설정과 일관된 구 컬렉션·manifest를 함께 복원하면 보존한 FP32 baseline으로 복귀할 수 있습니다. 새 코드의 `float32`로 구 manifest를 읽는 복귀는 1회 전체 FP32 sync 완료를 기다려야 합니다.
+
+[BF16 실측 결과·재현·전환/복귀 절차](2026-10-21-bf16-inference-results-and-runbook.md)를 먼저 확인하세요. 합성 Windows gate는 PASS였지만 호스트 end RSS가 **2.10→3.38 GiB로 증가**했고 peak RSS도 증가했습니다. 품질 신뢰구간은 0을 포함하며 critical 누락은 1→1, exact tie는 291→1114입니다. 운영 corpus 품질·실제 BF16 전환·장기 관측은 아직 미검증입니다.
 
 ---
 
@@ -252,6 +262,8 @@ Obsidian Vault에서 밀집 벡터(`BGE-m3-ko`)와 희소 BM25를 결합한 하�
 ### 5.2 `knowledge-index-status` (인덱스 상태 확인)
 컬렉션별 색인 상태(`completed`, `partial`), 등록된 청크 수(`point_count`), 최근 실행의 추가/수정/삭제 건수 및 오류 코드를 반환합니다.
 
+실시간 모델 상태는 `models`의 각 항목(단일 store는 최상위)에 `embedding_precision_policy`, `embedding_effective_dtype`, `embedding_device`를 추가합니다. `reranker`에는 `precision_policy`, `effective_dtype`, `device`, `loaded`, `last_fallback`이 있습니다. 초기화 전 dtype/device는 `null`일 수 있습니다. 상태 조회 자체는 모델을 로드하지 않으며 Qdrant 재조회 없이 현재 모델 사실을 갱신합니다. 전환 시 두 모델 dtype·fallback·색인 완료·실제 검색을 함께 확인하세요.
+
 ---
 
 ### 5.3 `knowledge-index-sync` (즉시 동기화 트리거)
@@ -282,7 +294,7 @@ $env:KNOWLEDGE_QDRANT_EXECUTABLE = "C:/Tools/qdrant-1.19.1/qdrant.exe"
 $env:KNOWLEDGE_QDRANT_NATIVE_STORAGE = "C:/Users/YourName/qdrant-native"
 ```
 
-네이티브 기본 저장소는 사용자 홈의 `%USERPROFILE%/.knowledge-qdrant/<프로젝트 경로 해시>`입니다. 짧은 경로는 Windows Gridstore의 긴 경로 실패를 방지합니다. 빈 폴더에만 `.knowledge-native-owner.json`을 생성하며, 표식 없는 임의의 기존 데이터 폴더는 거부합니다. 기본 경로 외에 별도 디렉터리를 사용하려면 `KNOWLEDGE_QDRANT_NATIVE_STORAGE` 환경 변수를 지정하세요. 정상 응답하는 localhost Qdrant 인스턴스(127.0.0.1:6333)가 이미 실행 중이면 자동으로 감지하여 우선 재사용합니다. Qdrant 6333/6334와 MCP 8765 기본 포트는 유지됩니다.
+네이티브 기본 저장소는 사용자 홈의 `%USERPROFILE%/.knowledge-qdrant/<프로젝트 경로 해시>`입니다. 짧은 경로는 Windows Gridstore의 긴 경로 실패를 방지합니다. 빈 폴더에만 `.knowledge-native-owner.json`을 생성하며, 표식 없는 임의의 기존 데이터 폴더는 거부합니다. 기본 경로 외에 별도 디렉터리를 사용하려면 `KNOWLEDGE_QDRANT_NATIVE_STORAGE` 환경 변수를 지정하세요. 정상 응답하는 localhost Qdrant 인스턴스(127.0.0.1:26333)가 이미 실행 중이면 감지하여 우선 재사용합니다. 현재 기본 포트는 Qdrant HTTP 26333/gRPC 26334, MCP 8765입니다. 구 URL 입력 6333은 26333으로 정규화됩니다.
 
 데이터 백업, snapshot 복원, 검증 및 선택적 서비스 등록에 대한 자세한 내용은 [Qdrant 상태 진단 및 색인 모니터링 가이드](qdrant-status-and-diagnostics.md#native-qdrant-migration)를 참조하세요. 복원이나 롤백이 필요한 경우 백업 데이터를 새로운 네이티브 저장소에 직접 복원합니다.
 
